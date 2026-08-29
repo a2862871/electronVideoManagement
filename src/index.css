@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    font-family: "Segoe UI", "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100vh;
+    margin: 0;
+    background: #020617;
+    color: #f1f5f9;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  * {
+    scrollbar-color: #475569 #0f172a;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: #0f172a;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    border: 2px solid #0f172a;
+    border-radius: 9999px;
+    background: #475569;
+  }
+
+  /* 自定义标题栏：整体可拖拽，交互控件排除拖拽 */
+  .titlebar {
+    -webkit-app-region: drag;
+  }
+
+  .titlebar button,
+  .titlebar input,
+  .titlebar select,
+  .titlebar a {
+    -webkit-app-region: no-drag;
+  }
+}
+
+/* ---------- 视觉焕新：环境光 / 动效 / 渐变工具类 ---------- */
+
+/* 环境光斑：两团 cyan / indigo 微光固定在视口角落，为纯黑底注入氛围 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(850px 520px at 12% -8%, rgba(34, 211, 238, 0.09), transparent 62%),
+    radial-gradient(950px 620px at 96% 108%, rgba(99, 102, 241, 0.11), transparent 62%),
+    radial-gradient(600px 400px at 78% 8%, rgba(56, 189, 248, 0.05), transparent 60%);
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes dialog-in {
+  from { opacity: 0; transform: scale(0.96) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+/* 列表卡片错峰入场（配合 style animationDelay） */
+.anim-fade-up {
+  animation: fade-up 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 对话框弹出 */
+.anim-dialog {
+  animation: dialog-in 0.22s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* 主按钮：cyan→indigo 渐变 + 光晕，hover 提亮、按下微缩 */
+.btn-primary {
+  background-image: linear-gradient(135deg, #0e7490 0%, #4f46e5 100%);
+  box-shadow: 0 2px 14px -4px rgba(34, 211, 238, 0.4);
+  transition: background-image 0.15s ease, box-shadow 0.2s ease, transform 0.1s ease;
+}
+.btn-primary:hover:not(:disabled) {
+  background-image: linear-gradient(135deg, #06b6d4 0%, #6366f1 100%);
+  box-shadow: 0 4px 20px -4px rgba(34, 211, 238, 0.5);
+}
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.btn-primary:disabled {
+  opacity: 0.45;
+}
+
+/* 渐变文字（标题 / 强调数字） */
+.text-gradient {
+  background-image: linear-gradient(92deg, #22d3ee 10%, #818cf8 90%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
