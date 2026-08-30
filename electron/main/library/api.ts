@@ -1,7 +1,7 @@
-import { app, dialog, ipcMain, protocol, shell } from 'electron'
+import { BrowserWindow, app, dialog, ipcMain, protocol, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
 import { createReadStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { copyFile, mkdir, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { copyFile, cp, mkdir, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
@@ -9,8 +9,21 @@ import { promisify } from 'node:util'
 import type { DatabaseSync } from 'node:sqlite'
 import { fileStem, parseFilename } from './filename'
 import * as repo from './repo'
-import { cacheThumb, uncacheThumb } from './thumbs'
+import { cacheThumb, getThumbLoadMode, setThumbLoadMode, uncacheThumb } from './thumbs'
 import { scanWatchFolder } from './scanner'
+import {
+  DEFAULT_COMPRESS_CONFIG,
+  buildArgs,
+  describeEncodeArgs,
+  finalPathFor,
+  findFfprobe,
+  needTwoPass,
+  passLogPath,
+  probeVideo,
+  runFfmpeg,
+  tempOutputPath,
+  type CompressConfig,
+} from './compress'
 import type { BatchUpdateArgs, VideoQuery, VideoUpdateArgs } from '../../../src/type/library'
 
 export const MEDIA_SCHEME = 'local-media'
@@ -119,6 +132,182 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     else favs.add(dirPath)
     repo.setSetting(db, 'favoriteDirs', JSON.stringify([...favs]))
     return favs.has(dirPath)
+  })
+
+  /** dir 在 root 之内（含相等）。 */
+  function isUnderDir(dir: string, root: string): boolean {
+    const rel = path.relative(root, dir)
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+  }
+
+  /**
+   * 把 src 目录的内容合并移动到已存在的 dst：同名文件直接覆盖，子目录递归合并。
+   * 同盘逐条 rename（瞬间）；跨盘回退 cp(force)+删除。
+   * 返回移动失败的文件路径（如文件被占用）；成功的文件已从 src 移除。
+   */
+  async function mergeMoveDir(src: string, dst: string): Promise<string[]> {
+    const failed: string[] = []
+    await mkdir(dst, { recursive: true })
+    const entries = await readdir(src, { withFileTypes: true })
+    for (const entry of entries) {
+      const s = path.join(src, entry.name)
+      const d = path.join(dst, entry.name)
+      if (entry.isDirectory()) {
+        if (existsSync(d)) {
+          // 目标同名子目录已存在 → 递归合并
+          failed.push(...(await mergeMoveDir(s, d)))
+          rmSync(s, { recursive: true, force: true }) // 内容已移走，清理空壳
+        } else {
+          try {
+            await rename(s, d)
+          } catch (e: any) {
+            if (e?.code === 'EXDEV') {
+              await cp(s, d, { recursive: true, force: true })
+              rmSync(s, { recursive: true, force: true })
+            } else throw e
+          }
+        }
+      } else {
+        // 文件：直接覆盖目标（Node 的 rename 在 Windows/POSIX 均可替换已存在文件）
+        try {
+          await rename(s, d)
+        } catch (e: any) {
+          if (e?.code === 'EXDEV') {
+            await cp(s, d, { force: true })
+            await unlink(s)
+          } else if (e?.code === 'EPERM' || e?.code === 'EACCES' || e?.code === 'EBUSY') {
+            failed.push(s) // 目标被占用等，保留在源目录
+          } else throw e
+        }
+      }
+    }
+    // 源目录内容已全部处理，删除空壳（失败的文件已被排除，rm 仅清目录）
+    if (failed.length === 0) rmSync(src, { recursive: true, force: true })
+    return failed
+  }
+
+  /**
+   * 移动整个文件夹：磁盘移动（同盘 rename 瞬间；跨盘复制+删除，较慢），
+   * 并在事务中同步更新该目录下所有视频的 path/sub_dir/folder_id 与收藏路径。
+   * 目标已存在同名目录时合并移动：同名文件直接覆盖。
+   */
+  ipcMain.handle('dir:move', async (_e, args: { src: string; targetParent: string }) => {
+    const src = path.resolve(String(args.src ?? ''))
+    const targetParent = path.resolve(String(args.targetParent ?? ''))
+    if (!src || !targetParent) return { ok: false as const, error: '参数缺失' }
+
+    // 基本校验
+    if (!existsSync(src) || !statSync(src).isDirectory()) return { ok: false as const, error: '源目录不存在' }
+    if (!existsSync(targetParent) || !statSync(targetParent).isDirectory()) {
+      return { ok: false as const, error: '目标父目录不存在' }
+    }
+    const name = path.basename(src)
+    const dst = path.join(targetParent, name)
+    if (path.resolve(dst) === path.resolve(src)) return { ok: false as const, error: '目标与源相同' }
+    if (isUnderDir(targetParent, src)) return { ok: false as const, error: '目标位置不能位于源目录内部' }
+    // 目标已存在同名目录 → 合并移动（同名文件覆盖），不再拒绝
+    const dstExists = existsSync(dst)
+
+    // 目标必须落在某个监控文件夹范围内（否则库中的记录将失去管理意义）
+    const folders = repo.listWatchFolders(db)
+    const targetFolder = folders.find((f) => isUnderDir(dst, f.path))
+    if (!targetFolder) {
+      return { ok: false as const, error: '目标位置不在任何监控文件夹范围内，移动后视频将无法在库中管理' }
+    }
+
+    // 受影响的视频
+    const prefix = src + path.sep
+    const rows = db.prepare('SELECT id, path FROM videos WHERE path LIKE ?').all(prefix + '%') as {
+      id: number
+      path: string
+    }[]
+    const crossDrive = path.parse(src).root !== path.parse(dst).root
+
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['取消', '移动'],
+      defaultId: 1,
+      cancelId: 0,
+      title: dstExists ? '移动并合并文件夹' : '移动文件夹',
+      message: dstExists
+        ? `目标位置已存在「${name}」，将把内容合并进去（同名文件直接覆盖）？`
+        : `将移动文件夹「${name}」到：\n${targetParent}`,
+      detail:
+        `包含 ${rows.length} 条视频记录，移动后路径将同步更新。\n` +
+        (dstExists
+          ? '⚠ 合并模式：目标目录中与源同名的文件将被覆盖，目标中其他文件保持不变。\n'
+          : '') +
+        (crossDrive
+          ? '⚠ 源与目标不在同一磁盘/挂载点，将采用「复制+删除」方式，大文件夹耗时可能很长。\n'
+          : '') +
+        '操作完成后自动刷新。',
+    })
+    if (response !== 1) return { ok: false as const, cancelled: true as const }
+
+    // 磁盘移动
+    let mergeFailed: string[] = []
+    try {
+      if (dstExists) {
+        // 合并移动（同盘逐条 rename / 跨盘复制+删除，均在内部处理）
+        mergeFailed = await mergeMoveDir(src, dst)
+      } else {
+        try {
+          await rename(src, dst)
+        } catch (e: any) {
+          if (e?.code !== 'EXDEV') throw e
+          // 跨盘：复制 + 删除（force 以防万一）
+          await cp(src, dst, { recursive: true, force: true })
+          rmSync(src, { recursive: true, force: true })
+        }
+      }
+    } catch (e: any) {
+      return { ok: false as const, error: `磁盘移动失败：${e?.message ?? String(e)}` }
+    }
+
+    // 数据库事务更新（合并模式下跳过移动失败的文件，其记录保持原路径）
+    const failedSet = new Set(mergeFailed)
+    const newPrefix = dst + path.sep
+    let updated = 0
+    try {
+      db.exec('BEGIN')
+      for (const row of rows) {
+        if (failedSet.has(row.path)) continue // 该文件未能移动，记录保持原路径
+        const newPath = newPrefix + row.path.slice(prefix.length)
+        const rel = path.relative(targetFolder.path, newPath)
+        const segs = rel.split(path.sep)
+        const subDir = !rel.startsWith('..') && segs.length > 1 ? segs[0] : null
+        db.prepare('UPDATE videos SET path = ?, sub_dir = ?, folder_id = ? WHERE id = ?').run(
+          newPath,
+          subDir,
+          targetFolder.id,
+          row.id,
+        )
+        updated++
+      }
+      // 收藏路径同步（前缀替换）
+      const favs = getFavoriteDirs()
+      const favList = [...favs]
+      const newFavs = favList.map((p) => (p.startsWith(prefix) ? newPrefix + p.slice(prefix.length) : p))
+      if (newFavs.some((p, i) => p !== favList[i])) {
+        repo.setSetting(db, 'favoriteDirs', JSON.stringify(newFavs))
+      }
+      db.exec('COMMIT')
+    } catch (e: any) {
+      db.exec('ROLLBACK')
+      return { ok: false as const, error: `数据库更新失败：${e?.message ?? String(e)}` }
+    }
+
+    if (mergeFailed.length > 0) {
+      const names = mergeFailed.slice(0, 3).map((p) => path.basename(p)).join('、')
+      return {
+        ok: true as const,
+        moved: updated,
+        dst,
+        partial: true as const,
+        error: `${mergeFailed.length} 个文件未能移动（可能被占用）：${names}${mergeFailed.length > 3 ? '…' : ''}`,
+      }
+    }
+    return { ok: true as const, moved: updated, dst }
   })
 
   ipcMain.handle('dir:list', async (_e, dirPath: string) => {
@@ -504,6 +693,215 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     repo.setSetting(db, args.key, args.value)
   })
 
+  // ---------- 缩略图加载模式 ----------
+  ipcMain.handle('thumbs:getMode', () => getThumbLoadMode(db))
+  ipcMain.handle('thumbs:setMode', (_e, mode: 'eager' | 'lazy') => setThumbLoadMode(db, mode))
+
+  // ---------- 视频压缩 ----------
+
+  function loadCompressConfig(): CompressConfig {
+    try {
+      const j = JSON.parse(repo.getSetting(db, 'compressConfig') ?? 'null')
+      if (j && typeof j === 'object') return { ...DEFAULT_COMPRESS_CONFIG, ...j }
+    } catch {
+      // 配置损坏则回落默认
+    }
+    return { ...DEFAULT_COMPRESS_CONFIG }
+  }
+
+  ipcMain.handle('compress:getConfig', () => loadCompressConfig())
+  ipcMain.handle('compress:setConfig', (_e, cfg: CompressConfig) => {
+    repo.setSetting(db, 'compressConfig', JSON.stringify({ ...DEFAULT_COMPRESS_CONFIG, ...cfg }))
+  })
+
+  // 压缩任务队列：串行执行（编码极耗 CPU/GPU，并发反而更慢）
+  let queue: { id: number; path: string; filename: string }[] = []
+  let running = false
+  let cancelled = false
+  let currentCancel: (() => void) | null = null
+
+  function pushCompressProgress(p: Record<string, unknown>): void {
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('compress:progress', p)
+  }
+
+  /** 压缩单个视频并替换原文件；返回处理结果。 */
+  async function compressOne(
+    ffmpeg: string,
+    ffprobe: string | null,
+    item: { id: number; path: string; filename: string },
+    cfg: CompressConfig,
+  ): Promise<{ ok: boolean; skipped?: boolean; error?: string; oldSize?: number; newSize?: number }> {
+    const tmpOut = tempOutputPath(item.path)
+    const pLog = passLogPath(tmpOut)
+    try {
+      const info = await probeVideo(ffmpeg, ffprobe, item.path)
+      if (!info.duration) return { ok: false, error: '无法读取视频时长' }
+
+      const twoPass = needTwoPass(cfg)
+      const passes = twoPass ? [1, 2] : [0]
+      for (const passNo of passes) {
+        // 两遍编码：分析占 0~50%，编码占 50~100%
+        const base = twoPass ? (passNo === 1 ? 0 : 50) : 0
+        const span = twoPass ? 50 : 100
+        const args = buildArgs(item.path, tmpOut, info, cfg, passNo, pLog)
+        const { promise, cancel } = runFfmpeg(ffmpeg, args, info.duration, (p) => {
+          pushCompressProgress({
+            videoId: item.id,
+            filename: item.filename,
+            percent: Math.min(100, base + (p.percent / 100) * span),
+            speed: p.speed,
+            outSize: p.outSize,
+            stage: twoPass ? (passNo === 1 ? '分析 1/2' : '编码 2/2') : '压缩中',
+          })
+        })
+        currentCancel = cancel
+        const { code, error } = await promise
+        currentCancel = null
+        if (cancelled) {
+          rmSync(tmpOut, { force: true })
+          return { ok: false, error: '已取消' }
+        }
+        if (code !== 0) {
+          rmSync(tmpOut, { force: true })
+          return { ok: false, error: (error || 'ffmpeg 执行失败').trim().slice(-300) }
+        }
+      }
+
+      // 清理两遍编码的临时日志
+      for (const junk of [`${pLog}-0.log`, `${pLog}-0.log.mbtree`]) {
+        try { rmSync(junk, { force: true }) } catch { /* 忽略 */ }
+      }
+
+      if (!existsSync(tmpOut)) return { ok: false, error: '未生成输出文件' }
+
+      const newStat = await stat(tmpOut)
+      const oldStat = await stat(item.path)
+      // 体积保护：默认仅当新文件更小时才替换，避免"越压越大"
+      if (cfg.onlyIfSmaller && newStat.size >= oldStat.size) {
+        rmSync(tmpOut, { force: true })
+        return { ok: true, skipped: true, oldSize: oldStat.size, newSize: newStat.size }
+      }
+
+      // 用新文件替换原文件：删除原文件 → 重命名新文件为最终名
+      const finalPath = finalPathFor(item.path)
+      await unlink(item.path)
+      await rename(tmpOut, finalPath)
+
+      // 更新数据库：路径/文件名可能变化（统一为 .mp4），体积与修改时间同步刷新
+      const fStat = await stat(finalPath)
+      db.prepare(`
+        UPDATE videos SET path = ?, filename = ?, size_bytes = ?, mtime = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(finalPath, path.basename(finalPath), fStat.size, Math.floor(fStat.mtimeMs), item.id)
+      // 缩略图 BLOB 内容仍对应同一画面，保留即可
+
+      return { ok: true, oldSize: oldStat.size, newSize: fStat.size }
+    } catch (e: any) {
+      try { rmSync(tmpOut, { force: true }) } catch { /* 忽略 */ }
+      return { ok: false, error: e?.message ?? String(e) }
+    }
+  }
+
+  /** 后台串行处理压缩队列，完成后广播汇总。 */
+  async function drainCompressQueue(ffmpeg: string, ffprobe: string | null, cfg: CompressConfig): Promise<void> {
+    if (running) return
+    running = true
+    const total = queue.length
+    let done = 0
+    let okCount = 0
+    let skipCount = 0
+    const failed: { filename: string; error: string }[] = []
+    let savedBytes = 0
+
+    while (queue.length > 0 && !cancelled) {
+      const item = queue.shift()!
+      // remaining：尚未开始处理的文件名（供前端显示剩余队列）
+      const remaining = queue.map((q) => q.filename)
+      pushCompressProgress({
+        videoId: item.id, filename: item.filename, percent: 0, speed: '', outSize: 0,
+        stage: '准备中', current: done + 1, total, remaining,
+      })
+      const r = await compressOne(ffmpeg, ffprobe, item, cfg)
+      done++
+      if (r.skipped) {
+        skipCount++
+      } else if (r.ok) {
+        okCount++
+        savedBytes += Math.max(0, (r.oldSize ?? 0) - (r.newSize ?? 0))
+      } else {
+        failed.push({ filename: item.filename, error: r.error ?? '未知错误' })
+      }
+      pushCompressProgress({
+        videoId: item.id, filename: item.filename, percent: 100, speed: '', outSize: r.newSize ?? 0,
+        stage: r.skipped ? '已跳过（未变小）' : r.ok ? '完成' : '失败', current: done, total,
+        remaining: queue.map((q) => q.filename),
+      })
+    }
+
+    queue = []
+    running = false
+    const wasCancelled = cancelled
+    cancelled = false
+    currentCancel = null
+    pushCompressProgress({
+      finished: true,
+      cancelled: wasCancelled,
+      ok: okCount,
+      skipped: skipCount,
+      failed,
+      savedBytes,
+      total,
+    })
+  }
+
+  ipcMain.handle('compress:start', async (_e, videos: { id: number; path: string; filename: string }[]) => {
+    const ffmpeg = repo.getSetting(db, 'ffmpegPath')
+    if (!ffmpeg) {
+      await dialog.showMessageBox({
+        type: 'warning', title: '未配置 FFmpeg',
+        message: '未配置 FFmpeg 路径，无法压缩视频。',
+        detail: '请在右上角「设置」中填写 FFmpeg 可执行文件路径。',
+      })
+      return { started: false }
+    }
+    const list = (videos ?? []).filter((v) => Number.isInteger(v.id) && v.path)
+    if (list.length === 0) return { started: false }
+
+    const cfg = loadCompressConfig()
+    const enc = describeEncodeArgs(cfg)
+    const qualityLabel = { high: '高画质', balanced: '均衡', small: '更小体积' }[cfg.quality]
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['取消', '开始压缩'],
+      defaultId: 1,
+      cancelId: 0,
+      title: '压缩视频（将替换原文件）',
+      message: `将压缩 ${list.length} 个视频并用新文件替换原文件，是否继续？`,
+      detail:
+        `${cfg.codec === 'hevc' ? 'H.265' : cfg.codec === 'h264' ? 'H.264' : 'AV1'} / ` +
+        `${cfg.mode === 'crf' ? qualityLabel : `目标 ${cfg.targetMB}MB`} / ` +
+        `${cfg.useGpu ? '显卡加速' : 'CPU'}\n` +
+        `编码器：${enc.encoder}\n` +
+        `参数：${enc.args}\n` +
+        (cfg.mode === 'size' && cfg.useGpu ? '（注：NVENC 不支持两遍编码，目标大小模式下退化为单遍）\n' : '') +
+        '\n压缩在后台进行，可继续使用软件。完成后原文件会被删除，替换为压缩后的文件。\n' +
+        '提示：压缩是有损的，建议确认重要视频已备份。',
+    })
+    if (response !== 1) return { started: false }
+
+    queue = list
+    cancelled = false
+    const ffprobe = await findFfprobe(ffmpeg)
+    void drainCompressQueue(ffmpeg, ffprobe, cfg) // 后台执行，不阻塞界面
+    return { started: true, count: list.length }
+  })
+
+  ipcMain.handle('compress:cancel', () => {
+    if (!running) return
+    cancelled = true
+    try { currentCancel?.() } catch { /* 忽略 */ }
+  })
+
   // ---------- 数据库目录迁移 ----------
   // 用 SQLite 原生 VACUUM INTO 在新目录生成一份完整一致的库副本（含缩略图 BLOB），
   // 全程不关闭当前连接：失败则原库分毫不动；成功写入引导配置后自动重启生效。
@@ -592,78 +990,139 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     }
   }
 
-  // 批量抽帧：对列表中每个视频取中间位置抽帧并写入数据库作为缩略图
-  ipcMain.handle('ffmpeg:batchThumbs', async (e, videos: { id: number; path: string }[]) => {
+  /**
+   * 一键补全媒体信息：合并「生成缩略图」与「读取时长」，按缺失情况处理：
+   * - 都有 → 跳过；只有缩略图 → 补时长；只有时长 → 补缩略图；都没有 → 两个都做
+   * - 时长只探测一次，抽帧复用该结果（不重复读取文件，IO 减半）
+   * - 4 路并发（SMB 场景并发过高反而变慢），带进度推送
+   */
+  ipcMain.handle('ffmpeg:batchMedia', async (e, videos: { id: number; path: string }[]) => {
     const ffmpeg = repo.getSetting(db, 'ffmpegPath')
     if (!ffmpeg) {
       await dialog.showMessageBox({
         type: 'warning',
         title: '未配置 FFmpeg',
-        message: '未配置 FFmpeg 路径，无法生成缩略图。',
+        message: '未配置 FFmpeg 路径，无法补全缩略图与时长。',
         detail: '请在右上角「设置」中填写 FFmpeg 可执行文件路径。',
       })
       return { cancelled: true, ok: 0, skipped: 0, failed: [] }
     }
-    const { response } = await dialog.showMessageBox({
-      type: 'question',
-      buttons: ['取消', '确认生成'],
-      defaultId: 1,
-      cancelId: 0,
-      title: '一键生成缩略图',
-      message: `将为 ${videos.length} 个视频从中间位置抽帧并设为缩略图，是否继续？`,
-      detail: '缩略图将以 BLOB 形式存入本地数据库（video_thumbs 表），启动时自动载入内存，展示零磁盘 IO。耗时取决于视频数量与大小。',
-    })
-    if (response !== 1) return { cancelled: true, ok: 0, skipped: 0, failed: [] }
 
-    const total = videos.length
-    let ok = 0
-    let skipped = 0
-    const failed: { id: number; path: string; error: string }[] = []
-    for (let i = 0; i < videos.length; i++) {
-      const v = videos[i]
-      e.sender.send('ffmpeg:batchThumbs:progress', { done: i, total, current: path.basename(v.path) })
-      // 已有 BLOB 则跳过
-      const existing = db.prepare(`
-        SELECT v.thumb_path AS thumb_path,
+    // 预检：逐个判断缺什么，统计待处理项
+    type Task = { id: number; path: string; needThumb: boolean; needRuntime: boolean }
+    const tasks: Task[] = []
+    for (const v of videos) {
+      const row = db.prepare(`
+        SELECT v.runtime AS runtime, v.thumb_path AS thumb_path,
           EXISTS (SELECT 1 FROM video_thumbs t WHERE t.video_id = v.id) AS has_blob
         FROM videos v WHERE v.id = ?
-      `).get(v.id) as { thumb_path: string | null; has_blob: number } | undefined
-      if (!existing) continue
-      if (existing.has_blob) {
-        skipped++
-        continue
-      }
-      // 磁盘上已有缩略图文件（旧版文件式缩略图 / NFO 自带）→ 直接读入导入 BLOB，零 ffmpeg 开销
-      if (existing.thumb_path && existsSync(existing.thumb_path)) {
+      `).get(v.id) as
+        | { runtime: number | null; thumb_path: string | null; has_blob: number }
+        | undefined
+      if (!row) continue
+      const needRuntime = !(row.runtime != null && row.runtime > 0)
+      const needThumb = !(row.has_blob || row.thumb_path)
+      if (!needRuntime && !needThumb) continue // 两样都有 → 跳过
+      tasks.push({ id: v.id, path: v.path, needThumb, needRuntime })
+    }
+
+    const total = tasks.length
+    if (total === 0) {
+      await dialog.showMessageBox({
+        type: 'info',
+        title: '无需处理',
+        message: '所选视频都已具备缩略图与时长信息。',
+        detail: '只有缺少其中任一项的视频才会被处理。',
+      })
+      return { cancelled: true, ok: 0, skipped: videos.length, failed: [] }
+    }
+
+    const needThumbCount = tasks.filter((t) => t.needThumb).length
+    const needRuntimeCount = tasks.filter((t) => t.needRuntime).length
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: ['取消', '确认处理'],
+      defaultId: 1,
+      cancelId: 0,
+      title: '一键补全信息',
+      message: `将为 ${total} 个视频补全缺失的信息，是否继续？`,
+      detail:
+        `需生成缩略图：${needThumbCount} 个\n需读取时长：${needRuntimeCount} 个\n` +
+        `已完整的 ${videos.length - total} 个视频将被跳过。\n\n` +
+        '缩略图以 BLOB 存入数据库；时长用 FFmpeg 读取（与刮削无关，适用于无 NFO 的视频）。\n' +
+        '两项都缺的视频只探测一次时长，抽帧复用该结果。耗时取决于视频数量与磁盘/网络速度。',
+    })
+    if (response !== 1) return { cancelled: true, ok: 0, skipped: videos.length - total, failed: [] }
+
+    const CONCURRENCY = 4
+    const failed: { id: number; path: string; error: string }[] = []
+    let ok = 0
+    let done = 0
+
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = done++
+        if (i >= total) return
+        const t = tasks[i]
+        e.sender.send('ffmpeg:batchMedia:progress', { done: i, total, current: path.basename(t.path) })
         try {
-          const data = await readFile(existing.thumb_path)
-          const mime = /\.png$/i.test(existing.thumb_path)
-            ? 'image/png'
-            : /\.webp$/i.test(existing.thumb_path)
-              ? 'image/webp'
-              : 'image/jpeg'
-          repo.setThumbBlob(db, v.id, data, mime)
-          cacheThumb(v.id, { data, mime })
+          // 时长：缺就探测一次；不缺但需抽帧时也要探测（抽帧需定位中间位置）
+          let sec = 0
+          if (t.needRuntime || t.needThumb) {
+            sec = await probeDurationSec(ffmpeg, t.path)
+            if (t.needRuntime) {
+              if (sec > 0) {
+                db.prepare("UPDATE videos SET runtime = ?, updated_at = datetime('now') WHERE id = ?").run(
+                  Math.round((sec / 60) * 100) / 100,
+                  t.id,
+                )
+              } else {
+                failed.push({ id: t.id, path: t.path, error: '无法读取时长（文件损坏或编码不支持）' })
+              }
+            }
+          }
+
+          if (t.needThumb) {
+            // 磁盘上已有缩略图文件（旧版文件式 / NFO 自带）→ 直接读入导入 BLOB，零 ffmpeg 开销
+            const pRow = db.prepare('SELECT thumb_path FROM videos WHERE id = ?').get(t.id) as
+              | { thumb_path: string | null }
+              | undefined
+            let imported = false
+            if (pRow?.thumb_path && existsSync(pRow.thumb_path)) {
+              try {
+                const data = await readFile(pRow.thumb_path)
+                const mime = /\.png$/i.test(pRow.thumb_path)
+                  ? 'image/png'
+                  : /\.webp$/i.test(pRow.thumb_path)
+                    ? 'image/webp'
+                    : 'image/jpeg'
+                repo.setThumbBlob(db, t.id, data, mime)
+                cacheThumb(t.id, { data, mime })
+                imported = true
+              } catch {
+                // 读取失败 → 回落到 ffmpeg 抽帧
+              }
+            }
+            if (!imported) {
+              if (sec <= 0) {
+                // probe 已失败过（且 needRuntime 时已记入 failed），这里补记避免漏报
+                if (!t.needRuntime) failed.push({ id: t.id, path: t.path, error: '无法读取视频时长' })
+              } else {
+                const r = await captureThumbBlob(ffmpeg, t.id, t.path, sec / 2)
+                if (!r.ok) failed.push({ id: t.id, path: t.path, error: r.error ?? '抽帧失败' })
+              }
+            }
+          }
           ok++
-          continue
-        } catch {
-          // 文件读取失败（权限/被占用），回落到 ffmpeg 抽帧
+        } catch (err: any) {
+          failed.push({ id: t.id, path: t.path, error: err?.message ?? String(err) })
         }
       }
-      const dur = await probeDurationSec(ffmpeg, v.path)
-      if (!dur) {
-        failed.push({ id: v.id, path: v.path, error: '无法读取视频时长' })
-        continue
-      }
-      const r = await captureThumbBlob(ffmpeg, v.id, v.path, dur / 2)
-      if (!r.ok) {
-        failed.push({ id: v.id, path: v.path, error: r.error ?? '抽帧失败' })
-        continue
-      }
-      ok++
     }
-    e.sender.send('ffmpeg:batchThumbs:progress', { done: total, total, current: '' })
-    return { cancelled: false, ok, skipped, failed }
+
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, total) }, worker))
+    e.sender.send('ffmpeg:batchMedia:progress', { done: total, total, current: '' })
+    return { cancelled: false, ok, skipped: videos.length - total, failed }
   })
 
   // 截到临时目录，仅用于对话框预览
@@ -837,21 +1296,8 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
    * 同时移除数据库记录（video_actors/video_tags 由外键级联清除）。
    * 二次确认使用原生对话框，无法撤销。
    */
-  ipcMain.handle('video:delete', async (_e, id: number) => {
-    const row = db.prepare('SELECT * FROM videos WHERE id = ?').get(id) as repo.VideoRow | undefined
-    if (!row) return { ok: false as const, error: '视频不存在（可能已删除）' }
-
-    const { response } = await dialog.showMessageBox({
-      type: 'warning',
-      buttons: ['取消', '彻底删除'],
-      defaultId: 0,
-      cancelId: 0,
-      title: '删除影片（不可恢复）',
-      message: `确定要从硬盘彻底删除「${row.filename}」？`,
-      detail: `此操作将直接删除文件，不经过回收站，且无法恢复！\n\n${row.path}`,
-    })
-    if (response !== 1) return { ok: false as const, cancelled: true as const }
-
+  /** 删除单个视频的磁盘文件（视频+NFO+缩略图）、库记录与内存缓存。不弹确认框，供单个/批量复用。 */
+  function removeVideoCompletely(row: repo.VideoRow): { failed: string[] } {
     const targets: { path: string; desc: string }[] = [{ path: row.path, desc: '视频文件' }]
     // 同名 NFO（与视频同目录）
     targets.push({ path: path.join(path.dirname(row.path), `${fileStem(path.basename(row.path))}.nfo`), desc: 'NFO 文件' })
@@ -867,13 +1313,65 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       }
     }
 
-    db.prepare('DELETE FROM videos WHERE id = ?').run(id)
-    uncacheThumb(id) // video_thumbs 由外键级联删除，同步移除内存缓存
+    db.prepare('DELETE FROM videos WHERE id = ?').run(row.id)
+    uncacheThumb(row.id) // video_thumbs 由外键级联删除，同步移除内存缓存
+    return { failed }
+  }
 
+  ipcMain.handle('video:delete', async (_e, id: number) => {
+    const row = db.prepare('SELECT * FROM videos WHERE id = ?').get(id) as repo.VideoRow | undefined
+    if (!row) return { ok: false as const, error: '视频不存在（可能已删除）' }
+
+    const { response } = await dialog.showMessageBox({
+      type: 'warning',
+      buttons: ['取消', '彻底删除'],
+      defaultId: 0,
+      cancelId: 0,
+      title: '删除影片（不可恢复）',
+      message: `确定要从硬盘彻底删除「${row.filename}」？`,
+      detail: `此操作将直接删除文件，不经过回收站，且无法恢复！\n\n${row.path}`,
+    })
+    if (response !== 1) return { ok: false as const, cancelled: true as const }
+
+    const { failed } = removeVideoCompletely(row)
     if (failed.length > 0) {
       return { ok: true as const, partial: true as const, failed }
     }
     return { ok: true as const }
+  })
+
+  // 批量删除：一次确认（避免逐个弹窗），逐个彻底删除并汇总失败项
+  ipcMain.handle('video:deleteMany', async (_e, ids: number[]) => {
+    const list = (ids ?? []).filter((n) => Number.isInteger(n))
+    if (list.length === 0) return { ok: false as const, error: '未选择任何视频' }
+
+    const rows: repo.VideoRow[] = []
+    for (const id of list) {
+      const row = db.prepare('SELECT * FROM videos WHERE id = ?').get(id) as repo.VideoRow | undefined
+      if (row) rows.push(row)
+    }
+    if (rows.length === 0) return { ok: false as const, error: '所选视频均不存在（可能已删除）' }
+
+    const preview = rows.slice(0, 6).map((r) => r.filename).join('\n')
+    const { response } = await dialog.showMessageBox({
+      type: 'warning',
+      buttons: ['取消', `彻底删除 ${rows.length} 个`],
+      defaultId: 0,
+      cancelId: 0,
+      title: '批量删除影片（不可恢复）',
+      message: `确定要从硬盘彻底删除这 ${rows.length} 个视频？`,
+      detail:
+        `${preview}${rows.length > 6 ? `\n…等共 ${rows.length} 个` : ''}\n\n` +
+        '此操作将直接删除文件（含同名 NFO 与缩略图），不经过回收站，且无法恢复！',
+    })
+    if (response !== 1) return { ok: false as const, cancelled: true as const }
+
+    const failed: string[] = []
+    for (const row of rows) {
+      const r = removeVideoCompletely(row)
+      if (r.failed.length > 0) failed.push(`${row.filename}（${r.failed.join('；')}）`)
+    }
+    return { ok: true as const, deleted: rows.length, failed }
   })
 
   // ---------- 外部播放（优先用配置的播放器） ----------

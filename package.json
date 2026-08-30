@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "个人视频库管理工具",
+  "author": "videolib",
+  "productName": "VideoLib",
   "license": "MIT",
   "type": "module",
   "main": "dist-electron/main/index.js",

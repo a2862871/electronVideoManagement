@@ -37,8 +37,12 @@ interface Props {
   onOpenSettings(): void
   /** 目录树中子目录被删除后回调（用于刷新列表/清理失效筛选） */
   onDirDeleted?(): void
+  /** 移动整个文件夹（改名/搼到其他目录），由 App 处理（选目标、调用后端、刷新） */
+  onMoveDir?(src: string): void
   /** 视频卡片拖拽到目录节点 / 主目录上释放后回调 */
   onDropVideos?(payload: VideoDndPayload, dirPath: string): void
+  /** 外部刷新信号（文件监听/聚焦兜底）：变化时重载所有目录栏 */
+  refreshSignal?: number
 }
 
 const itemCls = (active: boolean) =>
@@ -93,6 +97,7 @@ function Column({
   refreshKey = 0,
   onSelect,
   onDeleted,
+  onMoveDir,
   onDropVideos,
   onResize,
   onResizeEnd,
@@ -106,6 +111,7 @@ function Column({
   refreshKey?: number
   onSelect(path: string): void
   onDeleted?(): void
+  onMoveDir?(src: string): void
   onDropVideos?(payload: VideoDndPayload, dirPath: string): void
   onResize(newWidth: number): void
   onResizeEnd(): void
@@ -251,21 +257,23 @@ function Column({
     })
   }
 
-  /** 目录排序：手动顺序优先；无手动顺序时收藏置顶+名称序。末段应用文件夹名过滤（仅第一栏）。 */
+  /** 目录排序：收藏永远置顶（组内再套手动顺序或名称序）；末段应用文件夹名过滤（仅第一栏）。 */
   const sortedDirs = useMemo(() => {
     if (!dirs) return null
     const byName = (a: DirEntryDto, b: DirEntryDto) => a.name.localeCompare(b.name, 'zh-Hans-CN')
-    let list: DirEntryDto[]
-    if (dirOrder.length === 0) {
-      list = [...dirs].sort((a, b) => Number(b.favorite) - Number(a.favorite) || byName(a, b))
-    } else {
+    // 组内排序：有手动顺序时按其排（缺省项落尾按名称序），否则按名称序
+    const withinGroup = (arr: DirEntryDto[]): DirEntryDto[] => {
+      if (dirOrder.length === 0) return [...arr].sort(byName)
       const idx = new Map(dirOrder.map((p, i) => [p, i]))
-      list = [...dirs].sort((a, b) => {
+      return [...arr].sort((a, b) => {
         const ia = idx.get(a.path) ?? dirOrder.length
         const ib = idx.get(b.path) ?? dirOrder.length
         return ia !== ib ? ia - ib : byName(a, b)
       })
     }
+    const favs = withinGroup(dirs.filter((d) => d.favorite))
+    const rest = withinGroup(dirs.filter((d) => !d.favorite))
+    const list = [...favs, ...rest]
     const q = dirFilter.trim().toLowerCase()
     return q ? list.filter((d) => d.name.toLowerCase().includes(q)) : list
   }, [dirs, dirOrder, dirFilter])
@@ -441,6 +449,18 @@ function Column({
                 >
                   {menu.dir.favorite ? '取消收藏' : '收藏文件夹'}
                 </button>
+                {onMoveDir && (
+                  <button
+                    className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                    onClick={() => {
+                      const dir = menu.dir!
+                      setMenu(null)
+                      onMoveDir(dir.path)
+                    }}
+                  >
+                    移动文件夹…
+                  </button>
+                )}
                 <button
                   className='block w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-red-950/60'
                   onClick={() => {
@@ -536,6 +556,7 @@ function ActorColumn({
   folderId,
   activeActorId,
   width,
+  refreshKey = 0,
   onSelect,
   onResize,
   onResizeEnd,
@@ -543,6 +564,7 @@ function ActorColumn({
   folderId: number
   activeActorId?: number
   width: number
+  refreshKey?: number
   onSelect(actorId: number | null): void
   onResize(newWidth: number): void
   onResizeEnd(): void
@@ -573,6 +595,12 @@ function ActorColumn({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [folderId])
 
+  // 外部刷新信号（文件监听/聚焦兜底）：重载演员列表
+  useEffect(() => {
+    load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey])
+
   function saveOrder(list: number[]) {
     setOrder(list)
     window.api.getSetting(ACTOR_ORDERS_KEY).then((raw) => {
@@ -583,21 +611,22 @@ function ActorColumn({
     })
   }
 
-  // 排序：手动顺序优先；无手动顺序时收藏置顶+名称序。末段应用名称过滤。
+  // 排序：收藏永远置顶（组内再套手动顺序或名称序）；末段应用名称过滤。
   const sorted = useMemo(() => {
     if (!actors) return null
     const byName = (a: ActorDto, b: ActorDto) => a.name.localeCompare(b.name, 'zh-Hans-CN')
-    let list: ActorDto[]
-    if (order.length === 0) {
-      list = [...actors].sort((a, b) => Number(b.favorite) - Number(a.favorite) || byName(a, b))
-    } else {
+    const withinGroup = (arr: ActorDto[]): ActorDto[] => {
+      if (order.length === 0) return [...arr].sort(byName)
       const idx = new Map(order.map((id, i) => [id, i]))
-      list = [...actors].sort((a, b) => {
+      return [...arr].sort((a, b) => {
         const ia = idx.get(a.id) ?? order.length
         const ib = idx.get(b.id) ?? order.length
         return ia !== ib ? ia - ib : byName(a, b)
       })
     }
+    const favs = withinGroup(actors.filter((a) => a.favorite))
+    const rest = withinGroup(actors.filter((a) => !a.favorite))
+    const list = [...favs, ...rest]
     const q = filter.trim().toLowerCase()
     return q ? list.filter((a) => a.name.toLowerCase().includes(q)) : list
   }, [actors, order, filter])
@@ -749,7 +778,7 @@ function ActorColumn({
   )
 }
 
-export default function Sidebar({ folders, filters, onChange, onManageActors, onManageTags, onOpenSettings, onDirDeleted, onDropVideos }: Props) {
+export default function Sidebar({ folders, filters, onChange, onManageActors, onManageTags, onOpenSettings, onDirDeleted, onMoveDir, onDropVideos, refreshSignal }: Props) {
   const folder = folders.find((f) => f.id === filters.folderId)
   // 主目录按钮的拖放悬停高亮（拖到监控文件夹根 = 移到该文件夹根目录）
   const [dropFolder, setDropFolder] = useState<string | null>(null)
@@ -877,6 +906,7 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
           folderId={folder.id}
           activeActorId={filters.actorId}
           width={colWidths['actor'] ?? COL_WIDTH_DEFAULT}
+          refreshKey={dirRefreshKey + (refreshSignal ?? 0)}
           onSelect={(actorId) =>
             onChange(actorId == null ? { folderId: folder.id } : { folderId: folder.id, actorId })
           }
@@ -896,9 +926,10 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
             highlight={col.highlight}
             width={colWidths[wKey] ?? COL_WIDTH_DEFAULT}
             filterable={i === 0}
-            refreshKey={dirRefreshKey}
+            refreshKey={dirRefreshKey + (refreshSignal ?? 0)}
             onSelect={(p) => onChange({ folderId: filters.folderId, dirPath: p })}
             onDeleted={onDirDeleted}
+            onMoveDir={onMoveDir}
             onDropVideos={handleDropVideos}
             onResize={(w) => setColWidths((prev) => ({ ...prev, [wKey]: w }))}
             onResizeEnd={() =>

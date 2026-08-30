@@ -7,7 +7,8 @@ import os from 'node:os'
 import { MEDIA_SCHEME, registerLibraryIpc, registerMediaProtocol } from './library/api'
 import { openLibraryDb } from './library/db'
 import * as repo from './library/repo'
-import { THUMB_SCHEME, registerThumbProtocol } from './library/thumbs'
+import { THUMB_SCHEME, getThumbLoadMode, preloadThumbCache, registerThumbProtocol } from './library/thumbs'
+import { startFolderWatcher, triggerScanOnFocus } from './library/watcher'
 
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -20,6 +21,12 @@ if (process.env.ELECTRON_DISABLE_GPU === '1') {
   app.commandLine.appendSwitch('disable-gpu-sandbox')
   app.disableHardwareAcceleration()
 }
+
+// 最小化/遮挡后恢复窗口时，Chromium 默认会丢弃渲染层，恢复时需要整页重绘，
+// 表现为"闪一下"。以下开关让页面在后台仍保留渲染状态，可明显减轻该现象。
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+app.commandLine.appendSwitch('disable-renderer-backgrounding')
+app.commandLine.appendSwitch('disable-background-timer-throttling')
 
 // The built directory structure
 //
@@ -142,6 +149,13 @@ function resolveDataDir(): { dataDir: string; configFile: string } {
   return { dataDir, configFile }
 }
 
+/** 广播「监控目录有变动」给所有窗口，触发前端刷新目录/视频列表。 */
+function broadcastFoldersChanged(): void {
+  for (const w of BrowserWindow.getAllWindows()) {
+    w.webContents.send('folders:changed')
+  }
+}
+
 app.whenReady().then(() => {
   // 移除默认菜单栏（File/Edit/View 等）
   Menu.setApplicationMenu(null)
@@ -151,7 +165,16 @@ app.whenReady().then(() => {
   registerMediaProtocol()
   registerThumbProtocol(db)
   registerLibraryIpc(db, { dataDir, configFile })
+  startFolderWatcher(db, broadcastFoldersChanged)
+  // 按配置的缩略图加载模式决定是否启动时一次性载入内存
+  if (getThumbLoadMode(db) === 'eager') preloadThumbCache(db)
   createWindow()
+})
+
+// 窗口聚焦时兜底：SMB 挂载下 fs.watch 可能漏掉部分事件，
+// 切回应用时刷新界面并按节流自动扫描一次，保证新复制的文件及时入库。
+app.on('browser-window-focus', () => {
+  triggerScanOnFocus()
 })
 
 app.on('window-all-closed', () => {

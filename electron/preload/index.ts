@@ -30,7 +30,17 @@ contextBridge.exposeInMainWorld('api', {
   deleteDir: (dirPath: string) => ipcRenderer.invoke('dir:delete', dirPath),
   createDir: (args: { parentPath: string; name: string }) => ipcRenderer.invoke('dir:create', args),
   toggleDirFavorite: (dirPath: string) => ipcRenderer.invoke('dir:toggleFavorite', dirPath),
+  /** 移动整个文件夹（磁盘移动 + 数据库同步），返回移动的视频数 */
+  moveDir: (args: { src: string; targetParent: string }) => ipcRenderer.invoke('dir:move', args),
   toggleActorFavorite: (actorId: number) => ipcRenderer.invoke('actor:toggleFavorite', actorId),
+  getThumbLoadMode: () => ipcRenderer.invoke('thumbs:getMode'),
+  setThumbLoadMode: (mode: 'eager' | 'lazy') => ipcRenderer.invoke('thumbs:setMode', mode),
+  /** 监控目录有变动（文件增删改 / 窗口聚焦兜底），返回取消订阅函数 */
+  onFoldersChanged: (cb: () => void) => {
+    const listener = () => cb()
+    ipcRenderer.on('folders:changed', listener)
+    return () => ipcRenderer.off('folders:changed', listener)
+  },
   pickDirectory: () => ipcRenderer.invoke('folder:pick'),
   scan: (args?: { folderId?: number; dirPath?: string }) => ipcRenderer.invoke('scan:run', args),
   queryVideos: (q: Record<string, unknown>) => ipcRenderer.invoke('videos:query', q),
@@ -54,15 +64,28 @@ contextBridge.exposeInMainWorld('api', {
   pickFile: (opts?: { filters?: { name: string; extensions: string[] }[] }) => ipcRenderer.invoke('file:pick', opts),
   grabPreview: (args: { videoPath: string; timeSec: number }) => ipcRenderer.invoke('ffmpeg:grabPreview', args),
   grabFrame: (args: { videoPath: string; videoId: number; timeSec: number }) => ipcRenderer.invoke('ffmpeg:grabFrame', args),
-  batchGrabThumbs: (videos: { id: number; path: string }[]) => ipcRenderer.invoke('ffmpeg:batchThumbs', videos),
-  onBatchThumbProgress: (cb: (p: { done: number; total: number; current: string }) => void) => {
+  getCompressConfig: () => ipcRenderer.invoke('compress:getConfig'),
+  setCompressConfig: (cfg: unknown) => ipcRenderer.invoke('compress:setConfig', cfg),
+  /** 开始后台压缩（串行队列），完成后用新文件替换原文件 */
+  startCompress: (videos: { id: number; path: string; filename: string }[]) =>
+    ipcRenderer.invoke('compress:start', videos),
+  cancelCompress: () => ipcRenderer.invoke('compress:cancel'),
+  onCompressProgress: (cb: (p: CompressProgress) => void) => {
+    const listener = (_event: unknown, p: CompressProgress) => cb(p)
+    ipcRenderer.on('compress:progress', listener as never)
+    return () => ipcRenderer.off('compress:progress', listener as never)
+  },
+  /** 一键补全：缺缩略图补缩略图，缺时长补时长，都有则跳过 */
+  batchCompleteMedia: (videos: { id: number; path: string }[]) => ipcRenderer.invoke('ffmpeg:batchMedia', videos),
+  onBatchMediaProgress: (cb: (p: { done: number; total: number; current: string }) => void) => {
     const listener = (_event: unknown, p: { done: number; total: number; current: string }) => cb(p)
-    ipcRenderer.on('ffmpeg:batchThumbs:progress', listener as never)
-    return () => ipcRenderer.off('ffmpeg:batchThumbs:progress', listener as never)
+    ipcRenderer.on('ffmpeg:batchMedia:progress', listener as never)
+    return () => ipcRenderer.off('ffmpeg:batchMedia:progress', listener as never)
   },
   moveVideo: (args: { id: number; targetDir: string }) => ipcRenderer.invoke('video:move', args),
   renameVideo: (args: { id: number; newName: string }) => ipcRenderer.invoke('video:rename', args),
   deleteVideo: (id: number) => ipcRenderer.invoke('video:delete', id),
+  deleteVideos: (ids: number[]) => ipcRenderer.invoke('video:deleteMany', ids),
 })
 
 // --------- Preload scripts loading ---------

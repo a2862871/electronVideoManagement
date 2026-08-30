@@ -136,6 +136,71 @@ export interface BatchThumbItem {
   path: string
 }
 
+/** 视频压缩配置（编码参数参考用户的 python 压缩脚本） */
+export interface CompressConfig {
+  /** 编码格式：h264 兼容性最好 / hevc 体积约 H.264 的 60% / av1 最小但很慢 */
+  codec: 'h264' | 'hevc' | 'av1'
+  /** crf=质量优先；size=指定目标大小（两遍编码） */
+  mode: 'crf' | 'size'
+  /** 画质档位（crf 模式） */
+  quality: 'high' | 'balanced' | 'small'
+  /** 目标大小 MB（size 模式） */
+  targetMB: number
+  /** 编码速度，越慢体积越小（CPU + crf 模式生效） */
+  preset: 'medium' | 'slow' | 'slower' | 'veryslow'
+  /** 分辨率上限，0=保持原始 */
+  maxHeight: 0 | 1080 | 720 | 480
+  /** 帧率上限，0=保持原始 */
+  maxFps: 0 | 60 | 30 | 24
+  /** 音频码率 kbps */
+  audioBitrate: number
+  /** 使用 NVIDIA 显卡编码（NVENC），快很多但同画质体积略大 */
+  useGpu: boolean
+  /** 保留字幕流 */
+  keepSubtitles: boolean
+  /** 仅当新文件更小时才替换原文件 */
+  onlyIfSmaller: boolean
+}
+
+/** 默认压缩配置（与后端保持一致） */
+export const DEFAULT_COMPRESS_CONFIG: CompressConfig = {
+  codec: 'hevc',
+  mode: 'crf',
+  quality: 'balanced',
+  targetMB: 500,
+  preset: 'medium',
+  maxHeight: 0,
+  maxFps: 0,
+  audioBitrate: 128,
+  useGpu: false,
+  keepSubtitles: false,
+  onlyIfSmaller: true,
+}
+
+/** 压缩进度推送 */
+export interface CompressProgress {
+  videoId?: number
+  filename?: string
+  /** 当前文件进度百分比 */
+  percent?: number
+  speed?: string
+  outSize?: number
+  /** 阶段：准备中 / 压缩中 / 分析 1/2 / 编码 2/2 / 完成 / 失败 / 已跳过（未变小） */
+  stage?: string
+  /** 第几个 / 共几个 */
+  current?: number
+  total?: number
+  /** 尚未开始处理的文件名（剩余队列） */
+  remaining?: string[]
+  /** 全部完成时为 true */
+  finished?: boolean
+  cancelled?: boolean
+  ok?: number
+  skipped?: number
+  savedBytes?: number
+  failed?: { filename: string; error: string }[]
+}
+
 export interface BatchThumbResult {
   cancelled: boolean
   ok: number
@@ -164,8 +229,16 @@ export interface LibraryApi {
   createDir(args: { parentPath: string; name: string }): Promise<{ ok: boolean; path?: string; error?: string }>
   /** 切换目录收藏状态，返回切换后是否为收藏 */
   toggleDirFavorite(dirPath: string): Promise<boolean>
+  /** 移动整个文件夹到新的父目录（磁盘移动 + 数据库同步），返回移动的视频数 */
+  moveDir(args: { src: string; targetParent: string }): Promise<{ ok: boolean; cancelled?: boolean; moved?: number; dst?: string; error?: string }>
   /** 切换演员收藏状态，返回切换后是否为收藏 */
   toggleActorFavorite(actorId: number): Promise<boolean>
+  /** 订阅监控目录变更（文件增删改 / 窗口聚焦兜底），返回取消订阅函数 */
+  onFoldersChanged(cb: () => void): () => void
+  /** 获取缩略图加载模式：eager=一次性载入内存；lazy=按需读库 */
+  getThumbLoadMode(): Promise<'eager' | 'lazy'>
+  /** 设置缩略图加载模式（切到 eager 会立即预加载） */
+  setThumbLoadMode(mode: 'eager' | 'lazy'): Promise<'eager' | 'lazy'>
   pickDirectory(): Promise<string | null>
   scan(args?: { folderId?: number; dirPath?: string }): Promise<ScanSummaryDto[]>
   queryVideos(q: VideoQuery): Promise<VideoPageDto>
@@ -190,12 +263,25 @@ export interface LibraryApi {
   pickFile(opts?: { filters?: { name: string; extensions: string[] }[] }): Promise<string | null>
   grabPreview(args: { videoPath: string; timeSec: number }): Promise<GrabFrameResult>
   grabFrame(args: { videoPath: string; videoId: number; timeSec: number }): Promise<GrabFrameResult>
-  batchGrabThumbs(videos: BatchThumbItem[]): Promise<BatchThumbResult>
-  /** 订阅批量缩略图生成进度，返回取消订阅函数 */
-  onBatchThumbProgress(cb: (p: BatchThumbProgress) => void): () => void
+  /** 一键补全：缺缩略图补缩略图、缺时长补时长，两者都有则跳过 */
+  batchCompleteMedia(videos: BatchThumbItem[]): Promise<BatchThumbResult>
+  /** 订阅一键补全进度，返回取消订阅函数 */
+  onBatchMediaProgress(cb: (p: BatchThumbProgress) => void): () => void
+  /** 读取视频压缩配置 */
+  getCompressConfig(): Promise<CompressConfig>
+  /** 保存视频压缩配置 */
+  setCompressConfig(cfg: CompressConfig): Promise<void>
+  /** 开始后台压缩（串行队列），完成后用新文件替换原文件 */
+  startCompress(videos: { id: number; path: string; filename: string }[]): Promise<{ started: boolean; count?: number }>
+  /** 取消进行中的压缩任务 */
+  cancelCompress(): Promise<void>
+  /** 订阅压缩进度，返回取消订阅函数 */
+  onCompressProgress(cb: (p: CompressProgress) => void): () => void
   moveVideo(args: { id: number; targetDir: string }): Promise<{ ok: boolean; moved?: boolean; path?: string; error?: string }>
   renameVideo(args: { id: number; newName: string }): Promise<{ ok: boolean; renamed?: boolean; path?: string; filename?: string; error?: string }>
   deleteVideo(id: number): Promise<{ ok: boolean; cancelled?: boolean; partial?: boolean; failed?: string[]; error?: string }>
+  /** 批量彻底删除：一次确认（后端弹窗），返回删除数量与失败明细 */
+  deleteVideos(ids: number[]): Promise<{ ok: boolean; cancelled?: boolean; deleted?: number; failed?: string[]; error?: string }>
 }
 
 declare global {

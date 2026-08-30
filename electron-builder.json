@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
-  "appId": "YourAppID",
+  "appId": "com.videolib.app",
   "asar": true,
   "directories": {
     "output": "release/${version}"
@@ -9,14 +9,8 @@
     "dist-electron",
     "dist"
   ],
-  "mac": {
-    "artifactName": "${productName}_${version}.${ext}",
-    "target": [
-      "dmg",
-      "zip"
-    ]
-  },
   "win": {
+    "icon": "build/icon.ico",
     "target": [
       {
         "target": "nsis",
@@ -25,7 +19,7 @@
         ]
       }
     ],
-    "artifactName": "${productName}_${version}.${ext}",
+    "artifactName": "${productName}_${version}_x64.${ext}",
     "extraFiles": [
       {
         "from": "database",
