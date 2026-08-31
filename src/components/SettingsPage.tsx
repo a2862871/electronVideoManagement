@@ -623,6 +623,22 @@ function CompressSection() {
         </div>
 
         <div>
+          <label className={labelCls}>同时压缩数量</label>
+          <div className='flex gap-2'>
+            {[1, 2, 3, 4].map((n) => (
+              <button key={n} className={modeBtnCls(compress.concurrency === n)} onClick={() => updateCompress({ concurrency: n })}>
+                {n} 路
+              </button>
+            ))}
+          </div>
+          <div className='mt-1 text-xs text-slate-500'>
+            {compress.useGpu
+              ? 'NVENC 编码单元有限：多数 N 卡同时最多 3 路（40 系部分卡 5 路），路数超过上限会排队等待，反而变慢。'
+              : 'CPU 编码每路都会吃满部分核心，路数 ≤ 物理核心数收益明显，超出则互相争抢变慢。'}
+          </div>
+        </div>
+
+        <div>
           <label className={labelCls}>显卡加速（NVENC）</label>
           <div className='flex gap-2'>
             <button className={modeBtnCls(!compress.useGpu)} onClick={() => updateCompress({ useGpu: false })}>

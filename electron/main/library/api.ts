@@ -1,4 +1,4 @@
-import { BrowserWindow, app, dialog, ipcMain, protocol, shell } from 'electron'
+import { BrowserWindow, Notification, app, dialog, ipcMain, protocol, shell } from 'electron'
 import { execFile, spawn } from 'node:child_process'
 import { createReadStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { copyFile, cp, mkdir, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
@@ -475,7 +475,10 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     const offset = q.offset ?? 0
     const orderSql = q.sort === 'oldest'
       ? 'ORDER BY v.created_at ASC, v.id ASC'
-      : 'ORDER BY v.created_at DESC, v.id DESC'
+      : q.sort === 'name'
+        // 按文件名排序：NOCASE 忽略英文大小写；数字按字典序（番号类文件名基本为字母数字，效果符合直觉）
+        ? 'ORDER BY v.filename COLLATE NOCASE ASC, v.id ASC'
+        : 'ORDER BY v.created_at DESC, v.id DESC'
     // thumb_blob_ver：video_thumbs.updated_at 的秒级时间戳（0 = 无 BLOB），前端用作图片缓存版本号
     const rows = db.prepare(
       `SELECT v.*, COALESCE(CAST(strftime('%s', t.updated_at) AS INTEGER), 0) AS thumb_blob_ver
@@ -720,11 +723,12 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     repo.setSetting(db, 'compressConfig', JSON.stringify({ ...DEFAULT_COMPRESS_CONFIG, ...cfg }))
   })
 
-  // 压缩任务队列：串行执行（编码极耗 CPU/GPU，并发反而更慢）
+  // 压缩任务队列：按配置并发数（1~4 路）并行执行，worker pool 模式
   let queue: { id: number; path: string; filename: string }[] = []
   let running = false
   let cancelled = false
-  let currentCancel: (() => void) | null = null
+  // 活跃任务的取消句柄（videoId → cancel），支持多路并发下按任务取消
+  const activeCancels = new Map<number, () => void>()
 
   function pushCompressProgress(p: Record<string, unknown>): void {
     for (const w of BrowserWindow.getAllWindows()) w.webContents.send('compress:progress', p)
@@ -760,9 +764,9 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
             stage: twoPass ? (passNo === 1 ? '分析 1/2' : '编码 2/2') : '压缩中',
           })
         })
-        currentCancel = cancel
+        activeCancels.set(item.id, cancel)
         const { code, error } = await promise
-        currentCancel = null
+        activeCancels.delete(item.id)
         if (cancelled) {
           rmSync(tmpOut, { force: true })
           return { ok: false, error: '已取消' }
@@ -808,7 +812,7 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     }
   }
 
-  /** 后台串行处理压缩队列，完成后广播汇总。 */
+  /** 后台处理压缩队列（按配置 1~4 路并行），完成后广播汇总。 */
   async function drainCompressQueue(ffmpeg: string, ffprobe: string | null, cfg: CompressConfig): Promise<void> {
     if (running) return
     running = true
@@ -819,36 +823,41 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     const failed: { filename: string; error: string }[] = []
     let savedBytes = 0
 
-    while (queue.length > 0 && !cancelled) {
-      const item = queue.shift()!
-      // remaining：尚未开始处理的文件名（供前端显示剩余队列）
-      const remaining = queue.map((q) => q.filename)
-      pushCompressProgress({
-        videoId: item.id, filename: item.filename, percent: 0, speed: '', outSize: 0,
-        stage: '准备中', current: done + 1, total, remaining,
-      })
-      const r = await compressOne(ffmpeg, ffprobe, item, cfg)
-      done++
-      if (r.skipped) {
-        skipCount++
-      } else if (r.ok) {
-        okCount++
-        savedBytes += Math.max(0, (r.oldSize ?? 0) - (r.newSize ?? 0))
-      } else {
-        failed.push({ filename: item.filename, error: r.error ?? '未知错误' })
+    // worker pool：N 个 worker 并发从队列取任务（N = 配置的并发数，钳制 1~4）
+    const workers = Math.max(1, Math.min(4, Math.round(cfg.concurrency ?? 1)))
+    async function worker(): Promise<void> {
+      while (queue.length > 0 && !cancelled) {
+        const item = queue.shift()!
+        // remaining：尚未开始处理的文件名（供前端显示剩余队列）
+        const remaining = queue.map((q) => q.filename)
+        pushCompressProgress({
+          videoId: item.id, filename: item.filename, percent: 0, speed: '', outSize: 0,
+          stage: '准备中', current: done + 1, total, remaining,
+        })
+        const r = await compressOne(ffmpeg, ffprobe, item, cfg)
+        done++
+        if (r.skipped) {
+          skipCount++
+        } else if (r.ok) {
+          okCount++
+          savedBytes += Math.max(0, (r.oldSize ?? 0) - (r.newSize ?? 0))
+        } else {
+          failed.push({ filename: item.filename, error: r.error ?? '未知错误' })
+        }
+        pushCompressProgress({
+          videoId: item.id, filename: item.filename, percent: 100, speed: '', outSize: r.newSize ?? 0,
+          stage: r.skipped ? '已跳过（未变小）' : r.ok ? '完成' : '失败', current: done, total,
+          remaining: queue.map((q) => q.filename),
+        })
       }
-      pushCompressProgress({
-        videoId: item.id, filename: item.filename, percent: 100, speed: '', outSize: r.newSize ?? 0,
-        stage: r.skipped ? '已跳过（未变小）' : r.ok ? '完成' : '失败', current: done, total,
-        remaining: queue.map((q) => q.filename),
-      })
     }
+    await Promise.all(Array.from({ length: workers }, () => worker()))
 
     queue = []
     running = false
     const wasCancelled = cancelled
     cancelled = false
-    currentCancel = null
+    activeCancels.clear()
     pushCompressProgress({
       finished: true,
       cancelled: wasCancelled,
@@ -858,6 +867,30 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       savedBytes,
       total,
     })
+
+    // 队列结束（未取消时）：弹系统桌面通知（Windows 右下角 toast），点击通知把主窗口带到前台
+    if (!wasCancelled) {
+      const fmtSize = (bytes: number): string =>
+        bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GB` : `${(bytes / 1024 ** 2).toFixed(0)} MB`
+      const parts = [`${okCount} 个成功`]
+      if (skipCount > 0) parts.push(`${skipCount} 个跳过`)
+      if (failed.length > 0) parts.push(`${failed.length} 个失败`)
+      const title = okCount > 0 && failed.length === 0 ? '视频压缩完成' : '视频压缩结束'
+      const body =
+        parts.join('，') +
+        (savedBytes > 0 ? `，共节省 ${fmtSize(savedBytes)}` : '') +
+        (failed.length > 0 ? `\n首个失败：${failed[0].filename}` : '')
+      const notify = new Notification({ title, body, silent: false })
+      notify.on('click', () => {
+        const win = BrowserWindow.getAllWindows()[0]
+        if (win) {
+          if (win.isMinimized()) win.restore()
+          win.show()
+          win.focus()
+        }
+      })
+      notify.show()
+    }
   }
 
   ipcMain.handle('compress:start', async (_e, videos: { id: number; path: string; filename: string }[]) => {
@@ -905,7 +938,10 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
   ipcMain.handle('compress:cancel', () => {
     if (!running) return
     cancelled = true
-    try { currentCancel?.() } catch { /* 忽略 */ }
+    // 取消所有进行中的 ffmpeg 进程（多路并发）
+    for (const cancel of activeCancels.values()) {
+      try { cancel() } catch { /* 忽略 */ }
+    }
   })
 
   // ---------- 数据库目录迁移 ----------
@@ -1075,7 +1111,7 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
           // 时长：缺就探测一次；不缺但需抽帧时也要探测（抽帧需定位中间位置）
           let sec = 0
           if (t.needRuntime || t.needThumb) {
-            sec = await probeDurationSec(ffmpeg, t.path)
+            sec = (await probeDurationSec(ffmpeg, t.path)) ?? 0
             if (t.needRuntime) {
               if (sec > 0) {
                 db.prepare("UPDATE videos SET runtime = ?, updated_at = datetime('now') WHERE id = ?").run(

@@ -22,7 +22,7 @@ export default function App() {
   const [actors, setActors] = useState<ActorDto[]>([])
   const [filters, setFilters] = useState<Filters>({})
   const [search, setSearch] = useState('')
-  const [sort, setSort] = useState<'newest' | 'oldest'>('newest')
+  const [sort, setSort] = useState<'newest' | 'oldest' | 'name'>('newest')
   const [rows, setRows] = useState<VideoDto[]>([])
   const [total, setTotal] = useState(0)
   const [scanning, setScanning] = useState(false)
@@ -55,8 +55,10 @@ export default function App() {
   const [viewMode, setViewMode] = useState<'grid' | 'list'>('grid')
   // 封面基准高度（横图高度，设置项）
   const [coverH, setCoverH] = useState(DEFAULT_COVER_H)
-  // 后台压缩进度（压缩在后台串行执行，可继续浏览/切页面）
+  // 后台压缩进度（压缩在后台并行执行 1~4 路，可继续浏览/切页面）
   const [compress, setCompress] = useState<CompressProgress | null>(null)
+  // 多路并发时的活跃任务列表（按 videoId 去重，最多 4 行）
+  const [compressList, setCompressList] = useState<CompressProgress[]>([])
   // 是否展开剩余待压缩文件列表
   const [showRemaining, setShowRemaining] = useState(false)
 
@@ -138,6 +140,7 @@ export default function App() {
     const off = window.api.onCompressProgress((p) => {
       if (p.finished) {
         setCompress(null)
+        setCompressList([])
         const parts: string[] = []
         if (p.cancelled) parts.push('压缩已取消')
         if (p.ok) parts.push(`已压缩替换 ${p.ok} 个`)
@@ -151,11 +154,25 @@ export default function App() {
       // 合并式更新：ffmpeg 编码期间的高频进度不带 remaining，
       // 直接覆盖会让"剩余队列"列表闪烁消失——未携带时保留上一次的值
       setCompress((prev) => ({ ...prev, ...p, remaining: p.remaining ?? prev?.remaining }))
+      // 多路并发：按 videoId 维护活跃任务列表；终态（完成/失败/跳过）移除该行
+      if (p.videoId != null) {
+        const isFinal = p.stage === '完成' || p.stage === '失败' || p.stage === '已跳过（未变小）'
+        setCompressList((prev) => {
+          if (isFinal) return prev.filter((t) => t.videoId !== p.videoId)
+          const i = prev.findIndex((t) => t.videoId === p.videoId)
+          if (i >= 0) {
+            const next = [...prev]
+            next[i] = { ...next[i], ...p }
+            return next
+          }
+          return [...prev, p].slice(-4)
+        })
+      }
     })
     return off
   }, [hasApi, reloadVideos])
 
-  /** 发起压缩：支持单个（右键）与批量（框选）。后台执行，不阻塞界面。 */
+  /** 发起压缩：支持单个（右键）与批量（框选）。后台执行（1~4 路并行），不阻塞界面。 */
   async function startCompress(videos: { id: number; path: string; filename: string }[]) {
     if (videos.length === 0) return
     const r = await window.api.startCompress(videos)
@@ -168,6 +185,7 @@ export default function App() {
         stage: '准备中',
         remaining: videos.map((v) => v.filename),
       })
+      setCompressList([])
     }
   }
 
@@ -366,11 +384,12 @@ export default function App() {
         <select
           className='rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-sm text-slate-300 focus:border-cyan-500 focus:outline-none'
           value={sort}
-          onChange={(e) => setSort(e.target.value as 'newest' | 'oldest')}
-          title='按添加时间排序'
+          onChange={(e) => setSort(e.target.value as 'newest' | 'oldest' | 'name')}
+          title='排序方式'
         >
           <option value='newest'>最新添加</option>
           <option value='oldest'>最早添加</option>
+          <option value='name'>按名称</option>
         </select>
         <div className='ml-auto flex items-center gap-2'>
           {notice && <span className='text-xs text-cyan-300'>{notice}</span>}
@@ -647,35 +666,64 @@ export default function App() {
         </div>
       )}
 
-      {/* 后台压缩进度面板（压缩期间可继续浏览，固定右下角） */}
+      {/* 后台压缩进度面板（压缩期间可继续浏览，固定右下角；多路并发每路一行） */}
       {compress && (
-        <div className='anim-fade-up fixed bottom-4 right-4 z-40 w-80 rounded-xl border border-slate-700 bg-slate-900/95 p-3 shadow-2xl shadow-black/60 backdrop-blur'>
+        <div className='anim-fade-up fixed bottom-4 right-4 z-40 w-96 rounded-xl border border-slate-700 bg-slate-900/95 p-3 shadow-2xl shadow-black/60 backdrop-blur'>
           <div className='mb-1.5 flex items-center justify-between gap-2'>
-            <span className='text-sm font-medium text-slate-200'>视频压缩中</span>
+            <span className='text-sm font-medium text-slate-200'>
+              视频压缩中
+              {compressList.length > 1 && <span className='ml-1.5 text-xs text-cyan-300'>（{compressList.length} 路并行）</span>}
+            </span>
             <span className='text-xs text-slate-500'>
               {compress.total ? `${compress.current ?? 0}/${compress.total}` : ''}
             </span>
           </div>
-          <div
-            className='truncate text-xs text-slate-400'
-            title={compress.filename}
-          >
-            {compress.filename}
-          </div>
-          <div className='mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800'>
-            <div
-              className='h-full rounded-full bg-gradient-to-r from-cyan-500 to-indigo-500 transition-all duration-300'
-              style={{ width: `${Math.max(2, Math.min(100, compress.percent ?? 0))}%` }}
-            />
-          </div>
-          <div className='mt-1.5 flex items-center justify-between text-xs text-slate-500'>
-            <span>
-              {compress.stage ?? '压缩中'}
-              {compress.speed ? ` · ${compress.speed}` : ''}
-              {compress.outSize ? ` · ${(compress.outSize / 1024 / 1024).toFixed(1)}MB` : ''}
-            </span>
-            <span>{Math.round(compress.percent ?? 0)}%</span>
-          </div>
+
+          {/* 多路并发：每路一行（文件名 + 进度条 + 状态） */}
+          {compressList.length > 0 ? (
+            <div className='space-y-2'>
+              {compressList.map((t) => (
+                <div key={t.videoId}>
+                  <div className='truncate text-xs text-slate-400' title={t.filename}>
+                    {t.filename}
+                  </div>
+                  <div className='mt-1 h-1.5 overflow-hidden rounded-full bg-slate-800'>
+                    <div
+                      className='h-full rounded-full bg-gradient-to-r from-cyan-500 to-indigo-500 transition-all duration-300'
+                      style={{ width: `${Math.max(2, Math.min(100, t.percent ?? 0))}%` }}
+                    />
+                  </div>
+                  <div className='mt-0.5 flex items-center justify-between text-[11px] text-slate-500'>
+                    <span>
+                      {t.stage ?? '压缩中'}
+                      {t.speed ? ` · ${t.speed}` : ''}
+                    </span>
+                    <span className='tabular-nums'>{Math.round(t.percent ?? 0)}%</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <div className='truncate text-xs text-slate-400' title={compress.filename}>
+                {compress.filename}
+              </div>
+              <div className='mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800'>
+                <div
+                  className='h-full rounded-full bg-gradient-to-r from-cyan-500 to-indigo-500 transition-all duration-300'
+                  style={{ width: `${Math.max(2, Math.min(100, compress.percent ?? 0))}%` }}
+                />
+              </div>
+              <div className='mt-1.5 flex items-center justify-between text-xs text-slate-500'>
+                <span>
+                  {compress.stage ?? '压缩中'}
+                  {compress.speed ? ` · ${compress.speed}` : ''}
+                  {compress.outSize ? ` · ${(compress.outSize / 1024 / 1024).toFixed(1)}MB` : ''}
+                </span>
+                <span>{Math.round(compress.percent ?? 0)}%</span>
+              </div>
+            </>
+          )}
 
           {/* 剩余待压缩文件 */}
           {!!compress.remaining?.length && (

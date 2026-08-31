@@ -66,8 +66,8 @@ export interface VideoQuery {
   folderId?: number
   subDir?: string
   dirPath?: string
-  /** 排序：newest=按添加时间倒序（默认）；oldest=按添加时间正序 */
-  sort?: 'newest' | 'oldest'
+  /** 排序：newest=按添加时间倒序（默认）；oldest=按添加时间正序；name=按文件名升序 */
+  sort?: 'newest' | 'oldest' | 'name'
   limit?: number
   offset?: number
 }
@@ -158,6 +158,8 @@ export interface CompressConfig {
   audioBitrate: number
   /** 使用 NVIDIA 显卡编码（NVENC），快很多但同画质体积略大 */
   useGpu: boolean
+  /** 同时压缩的路数（1~4）：多路并行受 CPU 核心数/NVENC 编码单元限制 */
+  concurrency: number
   /** 保留字幕流 */
   keepSubtitles: boolean
   /** 仅当新文件更小时才替换原文件 */
@@ -175,6 +177,7 @@ export const DEFAULT_COMPRESS_CONFIG: CompressConfig = {
   maxFps: 0,
   audioBitrate: 128,
   useGpu: false,
+  concurrency: 1,
   keepSubtitles: false,
   onlyIfSmaller: true,
 }

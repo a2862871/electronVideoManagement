@@ -13,6 +13,10 @@ import { startFolderWatcher, triggerScanOnFocus } from './library/watcher'
 const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
+// Windows 桌面通知（toast）必须设置 AppUserModelId 才能正常显示；
+// 与 electron-builder 的 appId 保持一致，开发/打包版通知来源统一显示为应用名。
+app.setAppUserModelId('com.videolib.app')
+
 // 仅在显式要求时禁用 GPU（无 GPU 的沙箱/CI 环境）。
 // 用户桌面有显卡，禁用 GPU 会导致视频无法硬解播放，因此默认不禁用。
 // 注意不要加 disable-software-rasterizer：它会连软件渲染一起禁掉，视频直接黑屏。

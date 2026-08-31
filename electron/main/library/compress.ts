@@ -32,6 +32,8 @@ export interface CompressConfig {
   audioBitrate: number
   /** 使用 NVIDIA 显卡编码（NVENC） */
   useGpu: boolean
+  /** 同时压缩的路数（1~4）：多路并行受 CPU 核心数/NVENC 编码单元限制 */
+  concurrency: number
   /** 保留字幕流 */
   keepSubtitles: boolean
   /** 仅当新文件更小时才替换原文件（否则保留原文件） */
@@ -48,6 +50,7 @@ export const DEFAULT_COMPRESS_CONFIG: CompressConfig = {
   maxFps: 0,
   audioBitrate: 128,
   useGpu: false,
+  concurrency: 1,
   keepSubtitles: false,
   onlyIfSmaller: true,
 }
