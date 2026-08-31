@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS videos (
   mtime INTEGER,
   play_position_sec INTEGER NOT NULL DEFAULT 0,
   play_updated_at TEXT,
+  rotation INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -99,5 +100,9 @@ function migrate(db: DatabaseSync): void {
   const actorCols = db.prepare('PRAGMA table_info(actors)').all() as { name: string }[]
   if (!actorCols.some((c) => c.name === 'alias')) {
     db.exec('ALTER TABLE actors ADD COLUMN alias TEXT')
+  }
+  const videoCols = db.prepare('PRAGMA table_info(videos)').all() as { name: string }[]
+  if (!videoCols.some((c) => c.name === 'rotation')) {
+    db.exec('ALTER TABLE videos ADD COLUMN rotation INTEGER NOT NULL DEFAULT 0')
   }
 }

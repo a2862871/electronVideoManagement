@@ -502,6 +502,12 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     return { ...row, actors: actors.map((a) => a.name), tags: tags.map((t) => t.name) }
   })
 
+  // 保存画面旋转角度（90° 步进：0/90/180/270），播放器下次打开时自动应用
+  ipcMain.handle('video:setRotation', (_e, args: { id: number; rotation: number }) => {
+    const rot = ((Math.round(args.rotation) % 360) + 360) % 360
+    db.prepare("UPDATE videos SET rotation = ?, updated_at = datetime('now') WHERE id = ?").run(rot, args.id)
+  })
+
   ipcMain.handle('video:update', (_e, args: VideoUpdateArgs) => {
     db.prepare(`
       UPDATE videos SET title = ?, num = ?, part = ?, sub_dir = ?, plot = ?, releasedate = ?,

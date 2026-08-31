@@ -192,17 +192,12 @@ export default function App() {
     reloadVideos(0)
   }
 
-  // 拖拽视频卡片到目录树释放：整组移动到目标目录（须在同一主目录范围内）
-  async function moveVideosToDir(payload: { ids: number[]; folderId: number }, dirPath: string) {
-    const owner = folders.find((f) => f.id === payload.folderId)
-    if (owner && !dirPath.startsWith(owner.path)) {
-      flash('只能在同一主目录范围内移动（跨目录请用右键「移动视频到…」）')
-      return
-    }
+  // 批量移动多个视频到指定目录（不限制主目录范围；供拖拽投放/批量栏/右键菜单复用）
+  async function moveManyToDir(ids: number[], dirPath: string) {
     let moved = 0
     let same = 0
     const errors: string[] = []
-    for (const id of payload.ids) {
+    for (const id of ids) {
       const r = await window.api.moveVideo({ id, targetDir: dirPath })
       if (!r.ok) {
         errors.push(r.error ?? '移动失败')
@@ -215,10 +210,32 @@ export default function App() {
     const parts: string[] = []
     if (moved > 0) parts.push(`已移动 ${moved} 个`)
     if (same > 0) parts.push(`${same} 个已在目标目录`)
-    if (errors.length > 0) parts.push(`失败 ${errors.length}（${errors[0].slice(0, 60)}${errors.length > 1 ? '…' : ''}）`)
-    flash(parts.join('，') || '未发生移动')
-    reloadMeta()
-    reloadVideos(0)
+    if (errors.length > 0) parts.push(`${errors.length} 个失败`)
+    flash(parts.join('，') || '没有需要移动的视频')
+    if (errors.length > 0) console.warn('批量移动失败明细：', errors)
+    if (moved > 0) {
+      reloadMeta()
+      reloadVideos(0)
+    }
+  }
+
+  // 拖拽视频卡片到目录树释放：整组移动到目标目录（须在同一主目录范围内）
+  async function moveVideosToDir(payload: { ids: number[]; folderId: number }, dirPath: string) {
+    const owner = folders.find((f) => f.id === payload.folderId)
+    if (owner && !dirPath.startsWith(owner.path)) {
+      flash('只能在同一主目录范围内移动（跨目录请用右键「移动视频到…」）')
+      return
+    }
+    await moveManyToDir(payload.ids, dirPath)
+  }
+
+  // 选中视频批量移动：弹目录选择框，把整个选中集合移动过去
+  async function moveSelectedToDir() {
+    if (selectedIds.size === 0) return
+    const dir = await window.api.pickDirectory()
+    if (!dir) return
+    setSelectedIds(new Set())
+    await moveManyToDir([...selectedIds], dir)
   }
 
   // 批量删除框选的视频（后端一次确认，直接删硬盘文件，不可恢复）
@@ -457,9 +474,9 @@ export default function App() {
             />
           ) : (
             <>
-              {/* 预览区首行：左侧过滤标签 + 右侧操作条（视图切换/扫描此目录） */}
-              <div className='flex items-start justify-between gap-2 px-4 pt-3'>
-                <div className='flex min-w-0 flex-1 flex-wrap items-center gap-2'>
+              {/* 预览区首行：左侧过滤标签 + 右侧操作条（视图切换/扫描此目录）。固定高度并 sticky 置顶，滚动时始终吸在顶部 */}
+              <div className='sticky top-0 z-20 flex h-[42px] items-center justify-between gap-2 bg-slate-950 px-4'>
+                <div className='flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-hidden'>
                   {!search && filters.dirPath && (
                     <span className='inline-flex items-center gap-2 rounded-full bg-cyan-900/60 px-3 py-1 text-xs text-cyan-300'>
                       目录：{filters.dirPath.split(/[\\/]/).filter(Boolean).pop()}
@@ -596,6 +613,14 @@ export default function App() {
               disabled={batchDeleting}
             >
               批量编辑
+            </button>
+            <button
+              className='rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50'
+              onClick={moveSelectedToDir}
+              disabled={batchDeleting}
+              title='选择目标目录，把选中的全部视频移动过去'
+            >
+              移动到…
             </button>
             <button
               className='rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50'
@@ -757,6 +782,11 @@ export default function App() {
               onClick={async () => {
                 const v = cardMenu.video
                 setCardMenu(null)
+                // 右键的视频在选中集内且为多选 → 集体移动；否则只移动该视频
+                if (selectedIds.size > 1 && selectedIds.has(v.id)) {
+                  await moveSelectedToDir()
+                  return
+                }
                 const dir = await window.api.pickDirectory()
                 if (!dir) return
                 const r = await window.api.moveVideo({ id: v.id, targetDir: dir })
@@ -773,7 +803,9 @@ export default function App() {
                 reloadVideos(0)
               }}
             >
-              移动视频到…
+              {selectedIds.size > 1 && selectedIds.has(cardMenu.video.id)
+                ? `移动 ${selectedIds.size} 个视频到…`
+                : '移动视频到…'}
             </button>
             <div className='my-1 border-t border-slate-800' />
             <button

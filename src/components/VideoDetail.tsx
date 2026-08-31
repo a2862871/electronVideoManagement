@@ -21,18 +21,30 @@ export default function VideoDetail({ videoId, onClose }: Props) {
   const [playerError, setPlayerError] = useState('')
   // 对话框尺寸：按视频真实分辨率自适应（loadedmetadata 时计算）
   const [box, setBox] = useState<{ w: number; h: number } | null>(null)
+  // 画面旋转（90° 步进：0/90/180/270）：只在播放器黑色区域内旋转画面本身，
+  // 对话框与信息区保持不动（不随旋转换向）。
+  const [rotation, setRotation] = useState(0)
+  // 旋转角度的 ref 副本：fitBox 读取它而不产生依赖（避免旋转时窗口形态跳变）
+  const rotationRef = useRef(0)
+  // 旋转 90/270 时画面等比缩放系数：旋转后包围盒恰好放进播放区域
+  const [rotScale, setRotScale] = useState(1)
+  const playerRef = useRef<HTMLDivElement>(null)
   const { alert } = useDialog()
 
-  // 依视频纵横比在可用空间（96vw/92vh 扣除信息区）内计算对话框大小
+  // 依视频纵横比在可用空间（96vw/92vh 扣除信息区）内计算对话框大小。
+  // 打开播放器时按「已保存旋转角度」的方向适配窗口（旋转过 90° 的竖画面直接开竖窗）；
+  // 用户点击旋转按钮时不重算窗口（画面在黑框内旋转缩放，窗口形态稳定）。
   const fitBox = useCallback(() => {
     const v = videoRef.current
     if (!v || !v.videoWidth || !v.videoHeight) return
-    const r = v.videoWidth / v.videoHeight
+    const rot = rotationRef.current
+    const r = rot === 90 || rot === 270 ? v.videoHeight / v.videoWidth : v.videoWidth / v.videoHeight
     const PAD = 32 // 对话框 p-4 四周内边距
     const GAP = 12 // flex flex-col gap-3 的上下间距
+    const BTN_BAR = 42 // 底部按钮栏（约 30px）+ 间距
     const infoH = infoRef.current?.offsetHeight ?? 96
     const availW = window.innerWidth * 0.96 - PAD
-    const availH = window.innerHeight * 0.92 - PAD - GAP - infoH
+    const availH = window.innerHeight * 0.92 - PAD - GAP - infoH - BTN_BAR
     let h = availH
     let w = h * r
     if (w > availW) {
@@ -42,13 +54,55 @@ export default function VideoDetail({ videoId, onClose }: Props) {
     // 温和下限：避免竖屏/超宽视频把对话框压得过窄过扁
     w = Math.max(w, 420)
     h = Math.max(h, 260)
-    setBox({ w: Math.round(w) + PAD, h: Math.round(h) + PAD + GAP + infoH })
+    setBox({ w: Math.round(w) + PAD, h: Math.round(h) + PAD + GAP + infoH + BTN_BAR })
   }, [])
 
   useEffect(() => {
     window.addEventListener('resize', fitBox)
     return () => window.removeEventListener('resize', fitBox)
   }, [fitBox])
+
+  // 旋转 90/270 时：视频元素布局尺寸不变（未旋转的等比适配），
+  // 用 scale 把旋转后的包围盒缩放到恰好填满播放区域，画面只在黑框内转。
+  const updateRotScale = useCallback(() => {
+    const v = videoRef.current
+    const c = playerRef.current
+    if (!v || !c || !v.videoWidth || !v.videoHeight) return
+    if (rotation === 90 || rotation === 270) {
+      const cw = c.clientWidth
+      const ch = c.clientHeight
+      const nw = v.videoWidth
+      const nh = v.videoHeight
+      const k = Math.min(cw / nw, ch / nh) // 未旋转 contain 适配系数
+      setRotScale(Math.min(cw / (nh * k), ch / (nw * k)))
+    } else {
+      setRotScale(1)
+    }
+  }, [rotation])
+
+  // 旋转角度 / 元数据 / 对话框尺寸变化后重算缩放（box 就绪意味着容器尺寸已定）
+  useEffect(() => {
+    updateRotScale()
+  }, [updateRotScale, detail, box])
+
+  // 旋转 90° 并持久化到数据库（下次打开自动应用）
+  const rotateVideo = useCallback(() => {
+    setRotation((r) => {
+      const next = (r + 90) % 360
+      rotationRef.current = next
+      window.api.setVideoRotation({ id: videoId, rotation: next })
+      return next
+    })
+  }, [videoId])
+
+  // R 键快速旋转 90°（播放器打开时生效）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'r' || e.key === 'R') rotateVideo()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [rotateVideo])
 
   // 续播位置：getVideo 异步返回后暂存，onLoadedMetadata 时应用到 video
   // （video 元素在 detail 渲染后才存在，effect 里同步读 ref 是 null，必须延迟到渲染后）
@@ -58,7 +112,11 @@ export default function VideoDetail({ videoId, onClose }: Props) {
     window.api.getVideo(videoId).then((d) => {
       if (!d || disposed) return
       resumePosRef.current = d.play_position_sec || 0
+      rotationRef.current = ((d.rotation ?? 0) % 360 + 360) % 360
+      setRotation(rotationRef.current)
       setDetail(d)
+      // 若 metadata 先于此回调就绪，fitBox 已按 rotation=0 计算过 → 现在按已存角度重算窗口方向
+      fitBox()
     })
     return () => {
       disposed = true
@@ -136,12 +194,15 @@ export default function VideoDetail({ videoId, onClose }: Props) {
         </div>
 
         {/* 下方：播放器（原生控件：进度条/播放/音量/全屏，点击画面播放暂停） */}
-        <div className='relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg bg-black'>
+        <div ref={playerRef} className='relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg bg-black'>
           <video
             ref={videoRef}
             src={src ?? undefined}
             controls
             className='max-h-full max-w-full'
+            style={{
+              transform: rotation ? `rotate(${rotation}deg) scale(${rotScale})` : undefined,
+            }}
             onLoadedMetadata={handleMetadata}
             onVolumeChange={(e) => {
               // 实时记忆音量（拖动音量条/静音切换都会触发）
@@ -163,8 +224,19 @@ export default function VideoDetail({ videoId, onClose }: Props) {
               {playerError}
             </div>
           )}
+        </div>
+
+        {/* 底部按钮栏：独立于播放区域，不遮挡原生进度条 */}
+        <div className='flex shrink-0 items-center justify-end gap-2'>
           <button
-            className='absolute bottom-3 right-3 z-10 rounded-lg bg-slate-900/70 px-3 py-1.5 text-xs text-slate-300 backdrop-blur-sm transition-colors hover:bg-slate-800 hover:text-white'
+            className='rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition-colors hover:bg-slate-800 hover:text-white'
+            title='旋转画面 90°（快捷键 R），角度会保存，下次打开自动应用'
+            onClick={rotateVideo}
+          >
+            ⟳ 旋转 {rotation}°
+          </button>
+          <button
+            className='rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 transition-colors hover:bg-slate-800 hover:text-white'
             title='用设置中配置的外部播放器打开'
             onClick={async () => {
               const err = await window.api.openInPlayer(detail.path)

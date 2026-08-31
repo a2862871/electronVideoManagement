@@ -11,6 +11,10 @@ const DIR_ORDERS_KEY = 'dirOrders'
 const ACTOR_DND_MIME = 'application/x-videolib-actordnd'
 /** 手动演员顺序的 settings 键：{ [folderId]: number[] }（演员 id 数组） */
 const ACTOR_ORDERS_KEY = 'actorOrders'
+/** 主目录排序拖拽的 MIME */
+const FOLDER_DND_MIME = 'application/x-videolib-folderdnd'
+/** 手动主目录顺序的 settings 键：number[]（文件夹 id 数组，全局一份） */
+const FOLDER_ORDERS_KEY = 'folderOrders'
 
 export interface Filters {
   folderId?: number
@@ -782,6 +786,11 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
   const folder = folders.find((f) => f.id === filters.folderId)
   // 主目录按钮的拖放悬停高亮（拖到监控文件夹根 = 移到该文件夹根目录）
   const [dropFolder, setDropFolder] = useState<string | null>(null)
+  // —— 主目录手动排序（拖拽重排，settings.folderOrders 持久化）——
+  const [folderOrder, setFolderOrder] = useState<number[]>([])
+  const [folderDragId, setFolderDragId] = useState<number | null>(null)
+  // 插入线：'-id' = 目标上方，'+id' = 目标下方
+  const [folderDropLine, setFolderDropLine] = useState<string | null>(null)
   // 目录栏刷新信号：移动视频后自增，强制各栏重载目录计数
   const [dirRefreshKey, setDirRefreshKey] = useState(0)
   // 各目录栏宽度（localStorage 记忆；'root' = 第 0 栏视图+主目录）
@@ -820,6 +829,31 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
     setDirRefreshKey((k) => k + 1)
   }
 
+  // 启动时读取手动主目录顺序（settings.folderOrders）
+  useEffect(() => {
+    window.api.getSetting(FOLDER_ORDERS_KEY).then((raw) => {
+      try {
+        const arr = JSON.parse(raw ?? '[]')
+        setFolderOrder(Array.isArray(arr) ? arr.filter((n: unknown) => Number.isInteger(n)) : [])
+      } catch {
+        setFolderOrder([])
+      }
+    })
+  }, [])
+
+  /** 把手动顺序写入 settings.folderOrders。 */
+  function saveFolderOrder(list: number[]) {
+    setFolderOrder(list)
+    window.api.setSetting({ key: FOLDER_ORDERS_KEY, value: JSON.stringify(list) })
+  }
+
+  // 主目录显示顺序：有手动顺序按其排（缺省项落尾），否则按添加序（数据库 id 序）
+  const sortedFolders = useMemo(() => {
+    if (folderOrder.length === 0) return folders
+    const idx = new Map(folderOrder.map((id, i) => [id, i]))
+    return [...folders].sort((a, b) => (idx.get(a.id) ?? folderOrder.length) - (idx.get(b.id) ?? folderOrder.length))
+  }, [folders, folderOrder])
+
   return (
     <div className='flex min-h-0 shrink-0 overflow-x-auto border-r border-slate-800/80 bg-slate-950/60 backdrop-blur-xl'>
       {/* 第 0 栏：视图 + 主目录（宽度可拖拽调整，localStorage 记忆） */}
@@ -827,14 +861,47 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
         className='relative flex shrink-0 flex-col gap-3 overflow-y-auto p-2'
         style={{ width: colWidths['root'] ?? COL_WIDTH_DEFAULT }}
         onDragOver={(e) => {
+          // 主目录排序拖拽：按鼠标相对目标中线位置显示插入线
+          if (e.dataTransfer.types.includes(FOLDER_DND_MIME) && folderDragId != null) {
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'move'
+            const btn = (e.target as Element).closest('button[data-folder]')
+            if (!btn) { setFolderDropLine(null); return }
+            const id = Number(btn.getAttribute('data-folder'))
+            if (!Number.isInteger(id)) { setFolderDropLine(null); return }
+            const rect = btn.getBoundingClientRect()
+            const after = e.clientY > rect.top + rect.height / 2
+            setFolderDropLine(`${after ? '+' : '-'}${id}`)
+            return
+          }
           if (!e.dataTransfer.types.includes(VIDEO_DND_MIME)) return
           e.preventDefault()
           e.dataTransfer.dropEffect = 'move'
           const btn = (e.target as Element).closest('button[data-drop]')
           setDropFolder(btn?.getAttribute('data-drop') ?? null)
         }}
-        onDragLeave={() => setDropFolder(null)}
+        onDragLeave={() => { setDropFolder(null); setFolderDropLine(null) }}
         onDrop={(e) => {
+          // 主目录排序落下：按插入线重排并持久化
+          if (e.dataTransfer.types.includes(FOLDER_DND_MIME)) {
+            e.preventDefault()
+            e.stopPropagation()
+            const from = folderDragId
+            const line = folderDropLine
+            setFolderDragId(null)
+            setFolderDropLine(null)
+            if (from == null || !line) return
+            const after = line.startsWith('+')
+            const target = Number(line.slice(1))
+            if (target === from) return
+            const list = sortedFolders.map((f) => f.id).filter((id) => id !== from)
+            let i = list.indexOf(target)
+            if (i < 0) return
+            if (after) i++
+            list.splice(i, 0, from)
+            saveFolderOrder(list)
+            return
+          }
           e.preventDefault()
           setDropFolder(null)
           const btn = (e.target as Element).closest('button[data-drop]')
@@ -873,12 +940,21 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
         </div>
         <div className='space-y-0.5'>
           <div className='px-1 text-xs font-semibold tracking-wider text-slate-500'>主目录</div>
-          {folders.map((f) => (
+          {sortedFolders.map((f) => (
             <button
               key={f.id}
-              className={`${itemCls(filters.folderId === f.id)} ${dropFolder === f.path ? 'ring-1 ring-cyan-400' : ''}`}
+              className={`${itemCls(filters.folderId === f.id)} ${dropFolder === f.path ? 'ring-1 ring-cyan-400' : ''} ${folderDropLine === `-${f.id}` ? 'shadow-[inset_0_2px_0_#22d3ee]' : ''} ${folderDropLine === `+${f.id}` ? 'shadow-[inset_0_-2px_0_#22d3ee]' : ''} ${folderDragId === f.id ? 'opacity-40' : ''}`}
               title={f.path}
               data-drop={f.path}
+              data-folder={f.id}
+              draggable
+              onDragStart={(e) => {
+                // 排序拖拽与"视频卡片投放到主目录"分流：只携带文件夹 id
+                e.dataTransfer.effectAllowed = 'move'
+                e.dataTransfer.setData(FOLDER_DND_MIME, String(f.id))
+                setFolderDragId(f.id)
+              }}
+              onDragEnd={() => { setFolderDragId(null); setFolderDropLine(null) }}
               onClick={() => onChange({ folderId: f.id, actorId: filters.actorId, tagIds: filters.tagIds })}
             >
               {f.name}

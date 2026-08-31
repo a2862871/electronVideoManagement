@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { VideoDto } from '../type/library'
-import { coverOf, formatDuration, formatSizeGB } from '../utils/media'
+import { coverOf, formatDuration, formatSizeGB, mediaUrl } from '../utils/media'
 
 /** 卡片拖拽数据的 MIME 类型（Sidebar 目录节点按此识别投放） */
 export const VIDEO_DND_MIME = 'application/x-videolib-video'
@@ -111,13 +111,15 @@ interface CardProps {
   colW: number
   /** 是否处于多选模式（按住 Ctrl/Shift 时） */
   multiSelectMode: boolean
+  /** 当前选中 id 数组：卡片组全在选中集内时，拖拽携带整个选中集合（集体移动） */
+  selectionIds: number[]
   /** 上报封面真实比例，供父组件分列估算高度（稳定后不再变化） */
   onRatioResolved?(ratio: number): void
   onOpen(video: VideoDto): void
   onCardContextMenu?(e: React.MouseEvent, video: VideoDto): void
 }
 
-function CardInner({ card, selected, showDuration, showSize, coverH, colW, multiSelectMode, onRatioResolved, onOpen, onCardContextMenu, index }: CardProps & { index: number }) {
+function CardInner({ card, selected, showDuration, showSize, coverH, colW, multiSelectMode, selectionIds, onRatioResolved, onOpen, onCardContextMenu, index }: CardProps & { index: number }) {
   const src = coverOf(card.videos[0])
   // 内存 BLOB 缩略图（thumbcache://）已常驻主进程内存，直接同步加载并解码，
   // 不用 lazy——否则上滚时新进入视口的图才发起请求，会出现约 0.5s 的黑块。
@@ -136,6 +138,31 @@ function CardInner({ card, selected, showDuration, showSize, coverH, colW, multi
   // 宽度=列宽，高度按真实比例推导（极端比例由 coverHeightOf 内部钳制）
   const height = coverHeightOf(real, colW, coverH)
 
+  // —— 悬停预览：封面内静音循环播放视频（多集取第一集）——
+  // 延迟 400ms 才触发，快速划过不加载；离开即销毁，保证同时最多只有一个视频在播
+  const rotation = card.videos[0].rotation ?? 0
+  const [previewing, setPreviewing] = useState(false)
+  const previewSrc = mediaUrl(card.videos[0].path)
+  const hoverTimerRef = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (hoverTimerRef.current !== null) window.clearTimeout(hoverTimerRef.current)
+  }, [])
+  const onCoverEnter = useCallback(() => {
+    if (!previewSrc) return
+    if (hoverTimerRef.current !== null) window.clearTimeout(hoverTimerRef.current)
+    hoverTimerRef.current = window.setTimeout(() => {
+      hoverTimerRef.current = null
+      setPreviewing(true)
+    }, 400)
+  }, [previewSrc])
+  const onCoverLeave = useCallback(() => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current)
+      hoverTimerRef.current = null
+    }
+    setPreviewing(false)
+  }, [])
+
   return (
     <button
       className={`anim-fade-up group w-full overflow-hidden rounded-xl border bg-slate-900 text-left shadow-lg shadow-black/30 transition-all duration-200 hover:border-cyan-500/70 hover:shadow-[0_10px_32px_-8px_rgba(34,211,238,0.35)] ${
@@ -149,11 +176,17 @@ function CardInner({ card, selected, showDuration, showSize, coverH, colW, multi
       data-vids={card.videos.map((v) => v.id).join(',')}
       draggable
       onDragStart={(e) => {
-        // 携带整组视频（同番号多集一起移动）与所属主目录，供目录树投放校验
+        // 携带拖拽视频集合：该卡片组全部在选中集内且选中数量更多 → 携带整个选中集合
+        // （框选/Ctrl 多选后拖任意一张卡片即可集体移动）；否则按原逻辑携带本组（同番号多集一起移动）
+        const groupIds = card.videos.map((v) => v.id)
+        const ids =
+          selectionIds.length > groupIds.length && groupIds.every((id) => selectionIds.includes(id))
+            ? selectionIds
+            : groupIds
         e.dataTransfer.effectAllowed = 'move'
         e.dataTransfer.setData(
           VIDEO_DND_MIME,
-          JSON.stringify({ ids: card.videos.map((v) => v.id), folderId: card.videos[0].folder_id }),
+          JSON.stringify({ ids, folderId: card.videos[0].folder_id }),
         )
       }}
       onClick={() => onOpen(card.videos[0])}
@@ -162,7 +195,12 @@ function CardInner({ card, selected, showDuration, showSize, coverH, colW, multi
         onCardContextMenu?.(e, card.videos[0])
       }}
     >
-      <div className='relative w-full overflow-hidden bg-slate-800' style={{ height }}>
+      <div
+        className='relative w-full overflow-hidden bg-slate-800 [container-type:size]'
+        style={{ height }}
+        onMouseEnter={onCoverEnter}
+        onMouseLeave={onCoverLeave}
+      >
         {/* 选中角标 */}
         {selected && (
           <span className='absolute right-2 top-2 z-10 flex h-5 w-5 items-center justify-center rounded-md bg-cyan-500 text-xs font-bold text-slate-950 shadow'>
@@ -183,6 +221,31 @@ function CardInner({ card, selected, showDuration, showSize, coverH, colW, multi
           />
         ) : (
           <div className='flex h-full w-full items-center justify-center text-3xl text-slate-600'>▶</div>
+        )}
+        {/* 悬停预览：静音循环播放；pointer-events-none 不干扰拖拽/框选；加载失败静默回落封面 */}
+        {previewing && previewSrc && (
+          <video
+            src={previewSrc}
+            className='pointer-events-none object-cover'
+            style={
+              // 应用已保存的旋转角度：90/270 时元素取容器转置尺寸（100cqh × 100cqw），
+              // 旋转后恰好铺满封面区域（container-type:size 已在父容器声明）
+              rotation === 90 || rotation === 270
+                ? { position: 'absolute', left: '50%', top: '50%', width: '100cqh', height: '100cqw', transform: `translate(-50%, -50%) rotate(${rotation}deg)` }
+                : { position: 'absolute', inset: 0, width: '100%', height: '100%', transform: rotation ? `rotate(${rotation}deg)` : undefined }
+            }
+            autoPlay
+            muted
+            loop
+            playsInline
+            preload='auto'
+            onLoadedMetadata={(e) => {
+              // 跳过片头：从约 20% 处开始播（黑场/logo 片头不影响预览观感）；seek 失败无碍
+              const el = e.currentTarget
+              if (el.duration > 0 && Number.isFinite(el.duration)) el.currentTime = el.duration * 0.2
+            }}
+            onError={() => setPreviewing(false)}
+          />
         )}
         {/* 角标叠图：集数 */}
         {card.videos.length > 1 && (
@@ -372,6 +435,8 @@ export default function VideoGrid({ cards, selectedIds, onSelectionChange, showD
   }, [cards])
 
   const cols = useWaterfallLayout(cards, columns, colW, coverH, ratios)
+  // 选中 id 数组（稳定引用：仅选中集合变化时更新），供卡片拖拽判断是否携带整个选中集合
+  const selectionIds = useMemo(() => [...selectedIds], [selectedIds])
   // 卡片 key → 原始索引（用于入场动画延迟），避免渲染时逐个 indexOf 造成 O(n²)
   const indexMap = useMemo(() => new Map(cards.map((c, i) => [c.key, i])), [cards])
 
@@ -595,6 +660,7 @@ export default function VideoGrid({ cards, selectedIds, onSelectionChange, showD
                 coverH={coverH}
                 colW={colW}
                 multiSelectMode={multiSelectMode}
+                selectionIds={selectionIds}
                 onRatioResolved={ratioCb(card.key)}
                 onOpen={onOpen}
                 onCardContextMenu={onCardContextMenu}

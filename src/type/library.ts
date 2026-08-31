@@ -24,6 +24,8 @@ export interface VideoDto {
   mtime: number | null
   play_position_sec: number
   play_updated_at: string | null
+  /** 画面旋转角度（90° 步进：0/90/180/270），播放与悬停预览时应用 */
+  rotation: number
 }
 
 export interface VideoDetailDto extends VideoDto {

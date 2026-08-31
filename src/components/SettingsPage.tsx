@@ -23,11 +23,12 @@ const presetBtnCls = (active: boolean) =>
       : 'border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
   }`
 
-type Tab = 'folders' | 'app'
+type Tab = 'folders' | 'app' | 'compress'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'folders', label: '监控文件夹' },
   { key: 'app', label: '应用设置' },
+  { key: 'compress', label: '视频压缩' },
 ]
 
 const tabCls = (active: boolean) =>
@@ -53,6 +54,7 @@ export default function SettingsPage({ folders, onChanged }: Props) {
 
       {tab === 'folders' && <FoldersSection folders={folders} onChanged={onChanged} />}
       {tab === 'app' && <AppSection />}
+      {tab === 'compress' && <CompressSection />}
     </div>
   )
 }
@@ -221,7 +223,6 @@ function AppSection() {
   const [showDuration, setShowDuration] = useState(true)
   const [showSize, setShowSize] = useState(true)
   const [coverH, setCoverH] = useState(DEFAULT_COVER_H)
-  const [compress, setCompress] = useState<CompressConfig>(DEFAULT_COMPRESS_CONFIG)
   const [loaded, setLoaded] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -237,8 +238,7 @@ function AppSection() {
       window.api.getSetting('showDuration'),
       window.api.getSetting('showSize'),
       window.api.getSetting('coverHeight'),
-      window.api.getCompressConfig(),
-    ]).then(([f, p, d, m, a, sd, ss, ch, cc]) => {
+    ]).then(([f, p, d, m, a, sd, ss, ch]) => {
       setFfmpegPath(f ?? '')
       setPlayerPath(p ?? '')
       setDataDir(d ?? '')
@@ -248,17 +248,9 @@ function AppSection() {
       setShowSize(ss !== '0') // 默认开启
       const n = Number(ch)
       setCoverH(Number.isFinite(n) && n > 0 ? n : DEFAULT_COVER_H)
-      if (cc) setCompress(cc)
       setLoaded(true)
     })
   }, [])
-
-  // 压缩配置：修改后立即保存（无需点保存按钮）
-  async function updateCompress(patch: Partial<CompressConfig>) {
-    const next = { ...compress, ...patch }
-    setCompress(next)
-    await window.api.setCompressConfig(next)
-  }
 
   // 自动扫描开关：立即生效，无需点保存
   async function toggleAutoScan(next: boolean) {
@@ -452,186 +444,6 @@ function AppSection() {
           <div className='mt-1 text-xs text-slate-500'>压缩功能会优先使用同目录下的 ffprobe.exe 读取视频信息；找不到时自动回退用 ffmpeg 解析。</div>
         </div>
 
-        {/* ---------- 视频压缩参数 ---------- */}
-        <div className='space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3'>
-          <div className='text-sm font-medium text-slate-200'>视频压缩参数</div>
-
-          <div>
-            <label className={labelCls}>编码格式</label>
-            <div className='flex flex-wrap gap-2'>
-              {(
-                [
-                  ['h264', 'H.264'],
-                  ['hevc', 'H.265'],
-                  ['av1', 'AV1'],
-                ] as const
-              ).map(([key, text]) => (
-                <button key={key} className={modeBtnCls(compress.codec === key)} onClick={() => updateCompress({ codec: key })}>
-                  {text}
-                </button>
-              ))}
-            </div>
-            <div className='mt-1 text-xs text-slate-500'>
-              {compress.codec === 'h264' && '兼容性最好，手机/剪辑软件/网页通吃。'}
-              {compress.codec === 'hevc' && '同画质体积约为 H.264 的 60%，新设备基本都支持（推荐）。'}
-              {compress.codec === 'av1' && '体积最小，但编码很慢，适合长期存档。'}
-            </div>
-          </div>
-
-          <div>
-            <label className={labelCls}>控制方式</label>
-            <div className='flex gap-2'>
-              <button className={modeBtnCls(compress.mode === 'crf')} onClick={() => updateCompress({ mode: 'crf' })}>
-                质量优先（CRF）
-              </button>
-              <button className={modeBtnCls(compress.mode === 'size')} onClick={() => updateCompress({ mode: 'size' })}>
-                指定目标大小
-              </button>
-            </div>
-            <div className='mt-1 text-xs text-slate-500'>
-              {compress.mode === 'crf'
-                ? '按画质目标编码，体积自动最小（推荐）。'
-                : '两遍编码，可精确控制到 MB，但耗时约翻倍。'}
-            </div>
-          </div>
-
-          {compress.mode === 'crf' ? (
-            <div>
-              <label className={labelCls}>画质档位</label>
-              <div className='flex gap-2'>
-                {(
-                  [
-                    ['high', '高画质'],
-                    ['balanced', '均衡'],
-                    ['small', '更小体积'],
-                  ] as const
-                ).map(([key, text]) => (
-                  <button key={key} className={modeBtnCls(compress.quality === key)} onClick={() => updateCompress({ quality: key })}>
-                    {text}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : (
-            <div>
-              <label className={labelCls}>目标大小（MB）</label>
-              <input
-                className={inputCls}
-                type='number'
-                min={1}
-                value={compress.targetMB}
-                onChange={(e) => updateCompress({ targetMB: Math.max(1, Number(e.target.value) || 1) })}
-              />
-            </div>
-          )}
-
-          {compress.mode === 'crf' && compress.codec !== 'av1' && (
-            <div>
-              <label className={labelCls}>编码速度（CPU 模式生效）</label>
-              <div className='flex gap-2'>
-                {(['medium', 'slow', 'slower', 'veryslow'] as const).map((p) => (
-                  <button key={p} className={modeBtnCls(compress.preset === p)} onClick={() => updateCompress({ preset: p })}>
-                    {p === 'medium' ? '快' : p === 'slow' ? '慢' : p === 'slower' ? '很慢' : '极慢'}
-                  </button>
-                ))}
-              </div>
-              <div className='mt-1 text-xs text-slate-500'>越慢体积越小、画质越好，但耗时成倍增加。</div>
-            </div>
-          )}
-
-          <div className='grid grid-cols-2 gap-3'>
-            <div>
-              <label className={labelCls}>分辨率上限</label>
-              <select
-                className={inputCls}
-                value={compress.maxHeight}
-                onChange={(e) => updateCompress({ maxHeight: Number(e.target.value) as 0 | 1080 | 720 | 480 })}
-              >
-                <option value={0}>保持原始</option>
-                <option value={1080}>限制到 1080p</option>
-                <option value={720}>限制到 720p</option>
-                <option value={480}>限制到 480p</option>
-              </select>
-              <div className='mt-1 text-xs text-slate-500'>降分辨率是省体积最有效的手段。</div>
-            </div>
-            <div>
-              <label className={labelCls}>帧率上限</label>
-              <select
-                className={inputCls}
-                value={compress.maxFps}
-                onChange={(e) => updateCompress({ maxFps: Number(e.target.value) as 0 | 60 | 30 | 24 })}
-              >
-                <option value={0}>保持原始</option>
-                <option value={60}>限制到 60 fps</option>
-                <option value={30}>限制到 30 fps</option>
-                <option value={24}>限制到 24 fps</option>
-              </select>
-            </div>
-          </div>
-
-          <div>
-            <label className={labelCls}>音频码率</label>
-            <div className='flex gap-2'>
-              {[64, 96, 128, 192].map((b) => (
-                <button key={b} className={modeBtnCls(compress.audioBitrate === b)} onClick={() => updateCompress({ audioBitrate: b })}>
-                  {b}k
-                </button>
-              ))}
-            </div>
-            <div className='mt-1 text-xs text-slate-500'>立体声 128k 已足够。</div>
-          </div>
-
-          <div>
-            <label className={labelCls}>显卡加速（NVENC）</label>
-            <div className='flex gap-2'>
-              <button className={modeBtnCls(!compress.useGpu)} onClick={() => updateCompress({ useGpu: false })}>
-                CPU 编码
-              </button>
-              <button
-                className={modeBtnCls(compress.useGpu)}
-                onClick={() => updateCompress({ useGpu: true })}
-                disabled={compress.codec === 'av1'}
-              >
-                显卡编码
-              </button>
-            </div>
-            <div className='mt-1 text-xs text-slate-500'>
-              {compress.codec === 'av1'
-                ? 'AV1 暂不支持显卡加速。'
-                : compress.useGpu
-                  ? '快 5~10 倍，同画质体积约大 10~20%（需 N 卡）。'
-                  : '体积小、画质好，但较慢。'}
-            </div>
-          </div>
-
-          <div className='grid grid-cols-2 gap-3'>
-            <div>
-              <label className={labelCls}>字幕流</label>
-              <div className='flex gap-2'>
-                <button className={modeBtnCls(!compress.keepSubtitles)} onClick={() => updateCompress({ keepSubtitles: false })}>
-                  不保留
-                </button>
-                <button className={modeBtnCls(compress.keepSubtitles)} onClick={() => updateCompress({ keepSubtitles: true })}>
-                  保留
-                </button>
-              </div>
-            </div>
-            <div>
-              <label className={labelCls}>体积保护</label>
-              <div className='flex gap-2'>
-                <button className={modeBtnCls(compress.onlyIfSmaller)} onClick={() => updateCompress({ onlyIfSmaller: true })}>
-                  仅变小才替换
-                </button>
-                <button className={modeBtnCls(!compress.onlyIfSmaller)} onClick={() => updateCompress({ onlyIfSmaller: false })}>
-                  总是替换
-                </button>
-              </div>
-            </div>
-          </div>
-          <div className='text-xs text-slate-500'>
-            开启「仅变小才替换」时，若压缩后反而更大则保留原文件（避免源文件已被高效压缩时越压越大）。
-          </div>
-        </div>
         <div>
           <label className={labelCls}>外部播放器地址（留空则用系统默认播放器）</label>
           <div className='flex gap-2'>
@@ -653,6 +465,213 @@ function AppSection() {
         >
           {saving ? '保存中…' : '保存'}
         </button>
+      </div>
+    </div>
+  )
+}
+
+// ---------------- 视频压缩参数（独立 tab） ----------------
+
+function CompressSection() {
+  const [compress, setCompress] = useState<CompressConfig>(DEFAULT_COMPRESS_CONFIG)
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    window.api.getCompressConfig().then((cc) => {
+      if (cc) setCompress(cc)
+      setLoaded(true)
+    })
+  }, [])
+
+  // 修改后立即保存（无需点保存按钮）
+  async function updateCompress(patch: Partial<CompressConfig>) {
+    const next = { ...compress, ...patch }
+    setCompress(next)
+    await window.api.setCompressConfig(next)
+  }
+
+  if (!loaded) return null
+
+  return (
+    <div className='mx-auto max-w-3xl'>
+      <div className='space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3'>
+        <div className='text-sm font-medium text-slate-200'>视频压缩参数</div>
+
+        <div>
+          <label className={labelCls}>编码格式</label>
+          <div className='flex flex-wrap gap-2'>
+            {(
+              [
+                ['h264', 'H.264'],
+                ['hevc', 'H.265'],
+                ['av1', 'AV1'],
+              ] as const
+            ).map(([key, text]) => (
+              <button key={key} className={modeBtnCls(compress.codec === key)} onClick={() => updateCompress({ codec: key })}>
+                {text}
+              </button>
+            ))}
+          </div>
+          <div className='mt-1 text-xs text-slate-500'>
+            {compress.codec === 'h264' && '兼容性最好，手机/剪辑软件/网页通吃。'}
+            {compress.codec === 'hevc' && '同画质体积约为 H.264 的 60%，新设备基本都支持（推荐）。'}
+            {compress.codec === 'av1' && '体积最小，但编码很慢，适合长期存档。'}
+          </div>
+        </div>
+
+        <div>
+          <label className={labelCls}>控制方式</label>
+          <div className='flex gap-2'>
+            <button className={modeBtnCls(compress.mode === 'crf')} onClick={() => updateCompress({ mode: 'crf' })}>
+              质量优先（CRF）
+            </button>
+            <button className={modeBtnCls(compress.mode === 'size')} onClick={() => updateCompress({ mode: 'size' })}>
+              指定目标大小
+            </button>
+          </div>
+          <div className='mt-1 text-xs text-slate-500'>
+            {compress.mode === 'crf'
+              ? '按画质目标编码，体积自动最小（推荐）。'
+              : '两遍编码，可精确控制到 MB，但耗时约翻倍。'}
+          </div>
+        </div>
+
+        {compress.mode === 'crf' ? (
+          <div>
+            <label className={labelCls}>画质档位</label>
+            <div className='flex gap-2'>
+              {(
+                [
+                  ['high', '高画质'],
+                  ['balanced', '均衡'],
+                  ['small', '更小体积'],
+                ] as const
+              ).map(([key, text]) => (
+                <button key={key} className={modeBtnCls(compress.quality === key)} onClick={() => updateCompress({ quality: key })}>
+                  {text}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div>
+            <label className={labelCls}>目标大小（MB）</label>
+            <input
+              className={inputCls}
+              type='number'
+              min={1}
+              value={compress.targetMB}
+              onChange={(e) => updateCompress({ targetMB: Math.max(1, Number(e.target.value) || 1) })}
+            />
+          </div>
+        )}
+
+        {compress.mode === 'crf' && compress.codec !== 'av1' && (
+          <div>
+            <label className={labelCls}>编码速度（CPU 模式生效）</label>
+            <div className='flex gap-2'>
+              {(['medium', 'slow', 'slower', 'veryslow'] as const).map((p) => (
+                <button key={p} className={modeBtnCls(compress.preset === p)} onClick={() => updateCompress({ preset: p })}>
+                  {p === 'medium' ? '快' : p === 'slow' ? '慢' : p === 'slower' ? '很慢' : '极慢'}
+                </button>
+              ))}
+            </div>
+            <div className='mt-1 text-xs text-slate-500'>越慢体积越小、画质越好，但耗时成倍增加。</div>
+          </div>
+        )}
+
+        <div className='grid grid-cols-2 gap-3'>
+          <div>
+            <label className={labelCls}>分辨率上限</label>
+            <select
+              className={inputCls}
+              value={compress.maxHeight}
+              onChange={(e) => updateCompress({ maxHeight: Number(e.target.value) as 0 | 1080 | 720 | 480 })}
+            >
+              <option value={0}>保持原始</option>
+              <option value={1080}>限制到 1080p</option>
+              <option value={720}>限制到 720p</option>
+              <option value={480}>限制到 480p</option>
+            </select>
+            <div className='mt-1 text-xs text-slate-500'>降分辨率是省体积最有效的手段。</div>
+          </div>
+          <div>
+            <label className={labelCls}>帧率上限</label>
+            <select
+              className={inputCls}
+              value={compress.maxFps}
+              onChange={(e) => updateCompress({ maxFps: Number(e.target.value) as 0 | 60 | 30 | 24 })}
+            >
+              <option value={0}>保持原始</option>
+              <option value={60}>限制到 60 fps</option>
+              <option value={30}>限制到 30 fps</option>
+              <option value={24}>限制到 24 fps</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label className={labelCls}>音频码率</label>
+          <div className='flex gap-2'>
+            {[64, 96, 128, 192].map((b) => (
+              <button key={b} className={modeBtnCls(compress.audioBitrate === b)} onClick={() => updateCompress({ audioBitrate: b })}>
+                {b}k
+              </button>
+            ))}
+          </div>
+          <div className='mt-1 text-xs text-slate-500'>立体声 128k 已足够。</div>
+        </div>
+
+        <div>
+          <label className={labelCls}>显卡加速（NVENC）</label>
+          <div className='flex gap-2'>
+            <button className={modeBtnCls(!compress.useGpu)} onClick={() => updateCompress({ useGpu: false })}>
+              CPU 编码
+            </button>
+            <button
+              className={modeBtnCls(compress.useGpu)}
+              onClick={() => updateCompress({ useGpu: true })}
+              disabled={compress.codec === 'av1'}
+            >
+              显卡编码
+            </button>
+          </div>
+          <div className='mt-1 text-xs text-slate-500'>
+            {compress.codec === 'av1'
+              ? 'AV1 暂不支持显卡加速。'
+              : compress.useGpu
+                ? '快 5~10 倍，同画质体积约大 10~20%（需 N 卡）。'
+                : '体积小、画质好，但较慢。'}
+          </div>
+        </div>
+
+        <div className='grid grid-cols-2 gap-3'>
+          <div>
+            <label className={labelCls}>字幕流</label>
+            <div className='flex gap-2'>
+              <button className={modeBtnCls(!compress.keepSubtitles)} onClick={() => updateCompress({ keepSubtitles: false })}>
+                不保留
+              </button>
+              <button className={modeBtnCls(compress.keepSubtitles)} onClick={() => updateCompress({ keepSubtitles: true })}>
+                保留
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className={labelCls}>体积保护</label>
+            <div className='flex gap-2'>
+              <button className={modeBtnCls(compress.onlyIfSmaller)} onClick={() => updateCompress({ onlyIfSmaller: true })}>
+                仅变小才替换
+              </button>
+              <button className={modeBtnCls(!compress.onlyIfSmaller)} onClick={() => updateCompress({ onlyIfSmaller: false })}>
+                总是替换
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className='text-xs text-slate-500'>
+          开启「仅变小才替换」时，若压缩后反而更大则保留原文件（避免源文件已被高效压缩时越压越大）。
+        </div>
       </div>
     </div>
   )

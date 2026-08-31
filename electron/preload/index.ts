@@ -45,6 +45,8 @@ contextBridge.exposeInMainWorld('api', {
   scan: (args?: { folderId?: number; dirPath?: string }) => ipcRenderer.invoke('scan:run', args),
   queryVideos: (q: Record<string, unknown>) => ipcRenderer.invoke('videos:query', q),
   getVideo: (id: number) => ipcRenderer.invoke('video:get', id),
+  /** 保存视频画面旋转角度（0/90/180/270），下次打开自动应用 */
+  setVideoRotation: (args: { id: number; rotation: number }) => ipcRenderer.invoke('video:setRotation', args),
   updateVideo: (args: Record<string, unknown>) => ipcRenderer.invoke('video:update', args),
   batchUpdateVideos: (args: Record<string, unknown>) => ipcRenderer.invoke('video:batchUpdate', args),
   listTags: () => ipcRenderer.invoke('tags:list'),

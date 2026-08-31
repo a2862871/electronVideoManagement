@@ -1,4 +1,4 @@
-import { app, BrowserWindow, shell, ipcMain, protocol, Menu } from 'electron'
+import { app, BrowserWindow, screen, shell, ipcMain, protocol, Menu } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -71,11 +71,16 @@ protocol.registerSchemesAsPrivileged([
 ])
 
 async function createWindow() {
+  // 窗口默认尺寸：上限 2560×1440，但不超过屏幕工作区的 90%（避免窗口尺寸恰好等于
+  // 屏幕逻辑分辨率时占满整屏、视觉上等同全屏），四周留出边距呈现为普通窗口。
+  const work = screen.getPrimaryDisplay().workAreaSize
+  const width = Math.min(2560, Math.round(work.width * 0.9))
+  const height = Math.min(1440, Math.round(work.height * 0.9))
   win = new BrowserWindow({
     title: 'VideoLib',
     icon: path.join(process.env.VITE_PUBLIC, 'favicon.ico'),
-    width: 1920,
-    height: 1080,
+    width,
+    height,
     minWidth: 1280,
     minHeight: 720,
     // 隐藏原生标题栏，改用更矮的自定义标题栏（仅保留右上角窗口控制按钮）
