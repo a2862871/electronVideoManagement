@@ -1,6 +1,7 @@
 import { BrowserWindow, Notification, app, dialog, ipcMain, protocol, shell } from 'electron'
+import type { WebContents } from 'electron'
 import { execFile, spawn } from 'node:child_process'
-import { createReadStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, createWriteStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { copyFile, cp, mkdir, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,6 +9,7 @@ import { Readable } from 'node:stream'
 import { promisify } from 'node:util'
 import type { DatabaseSync } from 'node:sqlite'
 import { fileStem, parseFilename } from './filename'
+import { updateNfoFile, type NfoChanges } from './nfoWrite'
 import * as repo from './repo'
 import { cacheThumb, getThumbLoadMode, setThumbLoadMode, uncacheThumb } from './thumbs'
 import { scanWatchFolder } from './scanner'
@@ -24,7 +26,7 @@ import {
   tempOutputPath,
   type CompressConfig,
 } from './compress'
-import type { BatchUpdateArgs, VideoQuery, VideoUpdateArgs } from '../../../src/type/library'
+import type { BatchUpdateArgs, DirMoveProgress, VideoQuery, VideoUpdateArgs } from '../../../src/type/library'
 
 export const MEDIA_SCHEME = 'local-media'
 
@@ -140,12 +142,133 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
   }
 
+  // ---------- 移动文件夹进度上报 ----------
+  /** 移动进度上下文：统计总量并按字节推进，节流推送给渲染进程 */
+  interface DirMoveCtx {
+    sender: WebContents
+    totalFiles: number
+    totalBytes: number
+    doneFiles: number
+    doneBytes: number
+    lastSent: number
+  }
+
+  /** 向渲染进程推送移动进度（move 阶段 100ms 节流；scan/done/error 立即发送） */
+  function dirMoveReport(ctx: DirMoveCtx, phase: DirMoveProgress['phase'] = 'move', current?: string, error?: string) {
+    const now = Date.now()
+    if (phase === 'move' && now - ctx.lastSent < 100) return
+    ctx.lastSent = now
+    const percent =
+      phase === 'done' ? 100
+      : phase !== 'move' || ctx.totalBytes === 0 ? 0
+      : Math.min(99, Math.floor((ctx.doneBytes / ctx.totalBytes) * 100))
+    if (!ctx.sender.isDestroyed()) {
+      ctx.sender.send('dir:move:progress', {
+        phase,
+        percent,
+        doneFiles: ctx.doneFiles,
+        totalFiles: ctx.totalFiles,
+        doneBytes: ctx.doneBytes,
+        totalBytes: ctx.totalBytes,
+        current: current ?? '',
+        error,
+      } satisfies DirMoveProgress)
+    }
+  }
+
+  /** 累加已复制字节数并尝试推送（单文件流式复制中逐 chunk 调用） */
+  function dirMoveAddBytes(ctx: DirMoveCtx | undefined, n: number) {
+    if (!ctx) return
+    ctx.doneBytes += n
+    dirMoveReport(ctx)
+  }
+
+  /** 开始移动一个文件：文件数 +1，记录当前文件名 */
+  function dirMoveTickFile(ctx: DirMoveCtx | undefined, current: string) {
+    if (!ctx) return
+    ctx.doneFiles++
+    dirMoveReport(ctx, 'move', current)
+  }
+
+  /** 递归统计目录下文件数与总字节数（用于进度展示），无法读取的条目忽略 */
+  async function scanTreeSize(root: string): Promise<{ files: number; bytes: number }> {
+    let files = 0
+    let bytes = 0
+    async function walk(dir: string) {
+      let entries
+      try {
+        entries = await readdir(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const p = path.join(dir, entry.name)
+        if (entry.isDirectory()) await walk(p)
+        else {
+          try {
+            bytes += (await stat(p)).size
+            files++
+          } catch {
+            /* 忽略 */
+          }
+        }
+      }
+    }
+    await walk(root)
+    return { files, bytes }
+  }
+
+  // 复制缓冲：Node 流默认 64KB 小块在高延迟盘（NAS/网络盘）上吞吐极低，加大到 4MB 可跑满带宽
+  const COPY_HIGH_WATER_MARK = 4 * 1024 * 1024
+  // 同层文件并发复制数：多文件目录可显著提速（单大文件场景由大缓冲保证吞吐）
+  const COPY_CONCURRENCY = 4
+
+  /** 流式复制单个文件，每读到一块数据回调字节数（fs.cp 无进度钩子，故自实现） */
+  async function copyFileWithProgress(from: string, to: string, onBytes: (n: number) => void) {
+    await mkdir(path.dirname(to), { recursive: true })
+    await new Promise<void>((resolve, reject) => {
+      const rs = createReadStream(from, { highWaterMark: COPY_HIGH_WATER_MARK })
+      const ws = createWriteStream(to, { highWaterMark: COPY_HIGH_WATER_MARK })
+      rs.on('error', reject)
+      ws.on('error', reject)
+      ws.on('finish', () => resolve())
+      rs.on('data', (chunk) => onBytes(chunk.length))
+      rs.pipe(ws)
+    })
+  }
+
+  /** 递归复制整个目录（跨盘移动用），逐文件上报进度；同层文件有限并发以提升吞吐 */
+  async function copyTreeWithProgress(src: string, dst: string, ctx: DirMoveCtx | undefined) {
+    await mkdir(dst, { recursive: true })
+    const entries = await readdir(src, { withFileTypes: true })
+    const files = entries.filter((e2) => e2.isFile())
+    // 目录递归复制（串行）；文件用并发池复制，任一失败则等全部结束后抛出
+    let idx = 0
+    let firstErr: unknown
+    async function worker() {
+      while (idx < files.length && firstErr === undefined) {
+        const entry = files[idx++]
+        try {
+          dirMoveTickFile(ctx, entry.name)
+          await copyFileWithProgress(path.join(src, entry.name), path.join(dst, entry.name), (n) => dirMoveAddBytes(ctx, n))
+        } catch (err) {
+          firstErr ??= err
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(COPY_CONCURRENCY, files.length)) }, worker))
+    if (firstErr) throw firstErr
+    for (const entry of entries) {
+      if (entry.isDirectory()) await copyTreeWithProgress(path.join(src, entry.name), path.join(dst, entry.name), ctx)
+    }
+  }
+
   /**
    * 把 src 目录的内容合并移动到已存在的 dst：同名文件直接覆盖，子目录递归合并。
-   * 同盘逐条 rename（瞬间）；跨盘回退 cp(force)+删除。
+   * 同盘逐条 rename（瞬间）；跨盘回退复制+删除（带进度上报）。
    * 返回移动失败的文件路径（如文件被占用）；成功的文件已从 src 移除。
    */
-  async function mergeMoveDir(src: string, dst: string): Promise<string[]> {
+  async function mergeMoveDir(src: string, dst: string, ctx?: DirMoveCtx): Promise<string[]> {
     const failed: string[] = []
     await mkdir(dst, { recursive: true })
     const entries = await readdir(src, { withFileTypes: true })
@@ -162,7 +285,7 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
             await rename(s, d)
           } catch (e: any) {
             if (e?.code === 'EXDEV') {
-              await cp(s, d, { recursive: true, force: true })
+              await copyTreeWithProgress(s, d, ctx)
               rmSync(s, { recursive: true, force: true })
             } else throw e
           }
@@ -173,7 +296,8 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
           await rename(s, d)
         } catch (e: any) {
           if (e?.code === 'EXDEV') {
-            await cp(s, d, { force: true })
+            dirMoveTickFile(ctx, entry.name)
+            await copyFileWithProgress(s, d, (n) => dirMoveAddBytes(ctx, n))
             await unlink(s)
           } else if (e?.code === 'EPERM' || e?.code === 'EACCES' || e?.code === 'EBUSY') {
             failed.push(s) // 目标被占用等，保留在源目录
@@ -191,7 +315,7 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
    * 并在事务中同步更新该目录下所有视频的 path/sub_dir/folder_id 与收藏路径。
    * 目标已存在同名目录时合并移动：同名文件直接覆盖。
    */
-  ipcMain.handle('dir:move', async (_e, args: { src: string; targetParent: string }) => {
+  ipcMain.handle('dir:move', async (e, args: { src: string; targetParent: string }) => {
     const src = path.resolve(String(args.src ?? ''))
     const targetParent = path.resolve(String(args.targetParent ?? ''))
     if (!src || !targetParent) return { ok: false as const, error: '参数缺失' }
@@ -244,24 +368,37 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     })
     if (response !== 1) return { ok: false as const, cancelled: true as const }
 
+    // 进度上报：先统计源目录规模（跨盘复制时按字节展示；同盘 rename 瞬间完成，统计开销可接受）
+    const ctx: DirMoveCtx = { sender: e.sender, totalFiles: 0, totalBytes: 0, doneFiles: 0, doneBytes: 0, lastSent: 0 }
+    dirMoveReport(ctx, 'scan')
+    const size = await scanTreeSize(src).catch(() => ({ files: rows.length, bytes: 0 }))
+    ctx.totalFiles = size.files
+    ctx.totalBytes = size.bytes
+    dirMoveReport(ctx, 'move')
+
     // 磁盘移动
     let mergeFailed: string[] = []
     try {
       if (dstExists) {
         // 合并移动（同盘逐条 rename / 跨盘复制+删除，均在内部处理）
-        mergeFailed = await mergeMoveDir(src, dst)
+        mergeFailed = await mergeMoveDir(src, dst, ctx)
       } else {
         try {
           await rename(src, dst)
-        } catch (e: any) {
-          if (e?.code !== 'EXDEV') throw e
-          // 跨盘：复制 + 删除（force 以防万一）
-          await cp(src, dst, { recursive: true, force: true })
+          // 同盘瞬间完成 → 进度直接补满
+          ctx.doneFiles = ctx.totalFiles
+          ctx.doneBytes = ctx.totalBytes
+          dirMoveReport(ctx, 'move', name)
+        } catch (err: any) {
+          if (err?.code !== 'EXDEV') throw err
+          // 跨盘：复制 + 删除（带进度上报）
+          await copyTreeWithProgress(src, dst, ctx)
           rmSync(src, { recursive: true, force: true })
         }
       }
-    } catch (e: any) {
-      return { ok: false as const, error: `磁盘移动失败：${e?.message ?? String(e)}` }
+    } catch (err: any) {
+      dirMoveReport(ctx, 'error', '', `磁盘移动失败：${err?.message ?? String(err)}`)
+      return { ok: false as const, error: `磁盘移动失败：${err?.message ?? String(err)}` }
     }
 
     // 数据库事务更新（合并模式下跳过移动失败的文件，其记录保持原路径）
@@ -292,10 +429,13 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
         repo.setSetting(db, 'favoriteDirs', JSON.stringify(newFavs))
       }
       db.exec('COMMIT')
-    } catch (e: any) {
+    } catch (err: any) {
       db.exec('ROLLBACK')
-      return { ok: false as const, error: `数据库更新失败：${e?.message ?? String(e)}` }
+      dirMoveReport(ctx, 'error', '', `数据库更新失败：${err?.message ?? String(err)}`)
+      return { ok: false as const, error: `数据库更新失败：${err?.message ?? String(err)}` }
     }
+
+    dirMoveReport(ctx, 'done')
 
     if (mergeFailed.length > 0) {
       const names = mergeFailed.slice(0, 3).map((p) => path.basename(p)).join('、')
@@ -386,6 +526,83 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     } catch (e: any) {
       return { ok: false as const, error: `创建文件夹失败：${e?.message ?? String(e)}` }
     }
+  })
+
+  /**
+   * 重命名子文件夹（tree 布局二级/三级列的右键操作）：
+   * 磁盘同级改名后，同步更新其下全部视频记录的路径/sub_dir，
+   * 以及收藏目录、目录排序设置里受影响的前缀路径。
+   * 不能用于监控文件夹根目录（其显示名请在「文件夹」管理/设置中修改）。
+   */
+  ipcMain.handle('dir:rename', async (_e, args: { dirPath: string; newName: string }) => {
+    const src = path.resolve(String(args.dirPath ?? ''))
+    const newName = String(args.newName ?? '').trim()
+    if (!src || !newName) return { ok: false as const, error: '参数缺失' }
+    if (/[\\/:*?"<>|]/.test(newName)) return { ok: false as const, error: '文件夹名包含非法字符（\\ / : * ? " < > |）' }
+    if (!existsSync(src) || !statSync(src).isDirectory()) return { ok: false as const, error: '源文件夹不存在' }
+
+    const folders = repo.listWatchFolders(db)
+    const rootHit = folders.find((f) => path.resolve(f.path).toLowerCase() === src.toLowerCase())
+    if (rootHit) {
+      return { ok: false as const, error: '不能重命名监控文件夹根目录，请在「文件夹」管理中修改显示名称' }
+    }
+
+    const name = path.basename(src)
+    if (name === newName) return { ok: true as const, renamed: false as const }
+    const parent = path.dirname(src)
+    const dst = path.join(parent, newName)
+    if (existsSync(dst)) return { ok: false as const, error: `已存在同名文件或文件夹「${newName}」` }
+
+    // 磁盘改名（同级 rename，不跨卷）
+    try {
+      await rename(src, dst)
+    } catch (e: any) {
+      return { ok: false as const, error: `重命名文件夹失败：${e?.message ?? String(e)}` }
+    }
+
+    // 数据库事务：更新该目录下（含递归）视频记录的路径与 sub_dir
+    const prefix = src + path.sep
+    const newPrefix = dst + path.sep
+    const rows = db.prepare('SELECT id, path FROM videos WHERE path LIKE ?').all(prefix + '%') as { id: number; path: string }[]
+    const targetFolder = folders.find((f) => isUnderDir(dst, f.path))
+    try {
+      db.exec('BEGIN')
+      for (const row of rows) {
+        const newPath = newPrefix + row.path.slice(prefix.length)
+        const rel = path.relative(targetFolder?.path ?? parent, newPath)
+        const segs = rel.split(path.sep)
+        const subDir = !rel.startsWith('..') && segs.length > 1 ? segs[0] : null
+        db.prepare('UPDATE videos SET path = ?, sub_dir = ? WHERE id = ?').run(newPath, subDir, row.id)
+      }
+      // 收藏目录路径同步（前缀替换）
+      const favs = getFavoriteDirs()
+      const favList = [...favs]
+      const newFavs = favList.map((p) => (p.startsWith(prefix) ? newPrefix + p.slice(prefix.length) : p))
+      if (newFavs.some((p, i) => p !== favList[i])) {
+        repo.setSetting(db, 'favoriteDirs', JSON.stringify(newFavs))
+      }
+      db.exec('COMMIT')
+    } catch (e: any) {
+      db.exec('ROLLBACK')
+      return { ok: false as const, error: `数据库更新失败：${e?.message ?? String(e)}` }
+    }
+
+    // 目录手动排序 dirOrders：替换受影响路径的前缀
+    try {
+      const orders = JSON.parse(repo.getSetting(db, 'dirOrders') ?? '{}') as Record<string, string[]>
+      let changed = false
+      for (const key of Object.keys(orders)) {
+        orders[key] = orders[key].map((p) => {
+          if (p.startsWith(prefix)) { changed = true; return newPrefix + p.slice(prefix.length) }
+          return p
+        })
+      }
+      if (changed) repo.setSetting(db, 'dirOrders', JSON.stringify(orders))
+    } catch {
+      // 设置损坏则忽略
+    }
+
+    return { ok: true as const, renamed: true as const, path: dst, moved: rows.length }
   })
 
   /**
@@ -511,7 +728,22 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     db.prepare("UPDATE videos SET rotation = ?, updated_at = datetime('now') WHERE id = ?").run(rot, args.id)
   })
 
-  ipcMain.handle('video:update', (_e, args: VideoUpdateArgs) => {
+  // 把库内修改同步写回视频同名的 NFO（仅当该视频有 NFO 且文件存在时）。
+  // 返回错误信息；成功或无需同步返回 null。失败不影响数据库已保存的结果。
+  async function syncVideoNfo(id: number, changes: NfoChanges): Promise<string | null> {
+    try {
+      const row = db.prepare('SELECT path, has_nfo FROM videos WHERE id = ?').get(id) as { path: string; has_nfo: number } | undefined
+      if (!row || !row.has_nfo) return null
+      const nfoPath = path.join(path.dirname(row.path), `${fileStem(path.basename(row.path))}.nfo`)
+      if (!existsSync(nfoPath)) return null
+      await updateNfoFile(nfoPath, changes)
+      return null
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e)
+    }
+  }
+
+  ipcMain.handle('video:update', async (_e, args: VideoUpdateArgs) => {
     db.prepare(`
       UPDATE videos SET title = ?, num = ?, part = ?, sub_dir = ?, plot = ?, releasedate = ?,
         studio = ?, series = ?, rating = ?, originaltitle = ?, runtime = ?, updated_at = datetime('now')
@@ -528,6 +760,21 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       db.prepare('DELETE FROM video_tags WHERE video_id = ?').run(args.id)
       repo.addVideoTags(db, args.id, args.tagNames.filter(Boolean).map((n) => repo.ensureTag(db, n)))
     }
+    // 单个编辑是整体替换语义：未传的字段在数据库里也置空，NFO 同样按「清空」处理
+    const nfoError = await syncVideoNfo(args.id, {
+      title: args.title ?? null,
+      originaltitle: args.originaltitle ?? null,
+      num: args.num ?? null,
+      plot: args.plot ?? null,
+      releasedate: args.releasedate ?? null,
+      studio: args.studio ?? null,
+      series: args.series ?? null,
+      rating: args.rating ?? null,
+      runtime: args.runtime ?? null,
+      actors: args.actorNames ? { mode: 'set', names: args.actorNames.filter(Boolean) } : undefined,
+      tags: args.tagNames ? { mode: 'set', names: args.tagNames.filter(Boolean) } : undefined,
+    })
+    return nfoError ? { ok: true, nfoError } : { ok: true }
   })
 
   /**
@@ -535,9 +782,9 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
    * 演员/标签支持替换（set*）或追加（add*，INSERT OR IGNORE 不覆盖已有关联）。
    * 返回受影响的视频数量。
    */
-  ipcMain.handle('video:batchUpdate', (_e, args: BatchUpdateArgs) => {
+  ipcMain.handle('video:batchUpdate', async (_e, args: BatchUpdateArgs) => {
     const ids = (args.ids ?? []).filter((n) => Number.isInteger(n))
-    if (ids.length === 0) return 0
+    if (ids.length === 0) return { count: 0 }
 
     const sets: string[] = []
     const vals: (string | number | null)[] = []
@@ -574,7 +821,26 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       }
     }
 
-    return ids.length
+    // 同步写回有 NFO 的视频；批量语义下仅同步提交了的字段，未提交字段不动
+    const nfoChanges: NfoChanges = {}
+    if (args.studio !== undefined) nfoChanges.studio = args.studio || null
+    if (args.series !== undefined) nfoChanges.series = args.series || null
+    if (args.releasedate !== undefined) nfoChanges.releasedate = args.releasedate || null
+    if (args.rating !== undefined) nfoChanges.rating = args.rating
+    if (args.setActors) nfoChanges.actors = { mode: 'set', names: args.setActors }
+    else if (args.addActors?.length) nfoChanges.actors = { mode: 'add', names: args.addActors }
+    if (args.setTags) nfoChanges.tags = { mode: 'set', names: args.setTags }
+    else if (args.addTags?.length) nfoChanges.tags = { mode: 'add', names: args.addTags }
+
+    let nfoError: string | null = null
+    if (Object.keys(nfoChanges).length > 0) {
+      for (const id of ids) {
+        const err = await syncVideoNfo(id, nfoChanges)
+        if (err && !nfoError) nfoError = err
+      }
+    }
+
+    return { count: ids.length, nfoError: nfoError ?? undefined }
   })
 
   ipcMain.handle('tags:list', () => {
@@ -695,6 +961,15 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     return { ok: true as const, count }
   })
 
+  // 删除演员：仅删除演员记录与作品关联（返回解除的关联数），视频数据不受影响
+  ipcMain.handle('actors:delete', (_e, id: number) => {
+    const removed = repo.deleteActor(db, id)
+    // 同步清理收藏列表里残留的 id
+    const favs = getActorFavorites()
+    if (favs.delete(id)) repo.setSetting(db, 'actorFavorites', JSON.stringify([...favs]))
+    return removed
+  })
+
   // ---------- 设置 ----------
   ipcMain.handle('settings:get', (_e, key: string) => repo.getSetting(db, key))
 
@@ -724,7 +999,8 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
   })
 
   // 压缩任务队列：按配置并发数（1~4 路）并行执行，worker pool 模式
-  let queue: { id: number; path: string; filename: string }[] = []
+  // rotation：可选的烧录旋转角度（0/90/180/270），「旋转压缩」入口传入
+  let queue: { id: number; path: string; filename: string; rotation?: number }[] = []
   let running = false
   let cancelled = false
   // 活跃任务的取消句柄（videoId → cancel），支持多路并发下按任务取消
@@ -738,11 +1014,12 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
   async function compressOne(
     ffmpeg: string,
     ffprobe: string | null,
-    item: { id: number; path: string; filename: string },
+    item: { id: number; path: string; filename: string; rotation?: number },
     cfg: CompressConfig,
   ): Promise<{ ok: boolean; skipped?: boolean; error?: string; oldSize?: number; newSize?: number }> {
     const tmpOut = tempOutputPath(item.path)
     const pLog = passLogPath(tmpOut)
+    const rotation = item.rotation ?? 0
     try {
       const info = await probeVideo(ffmpeg, ffprobe, item.path)
       if (!info.duration) return { ok: false, error: '无法读取视频时长' }
@@ -753,7 +1030,7 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
         // 两遍编码：分析占 0~50%，编码占 50~100%
         const base = twoPass ? (passNo === 1 ? 0 : 50) : 0
         const span = twoPass ? 50 : 100
-        const args = buildArgs(item.path, tmpOut, info, cfg, passNo, pLog)
+        const args = buildArgs(item.path, tmpOut, info, cfg, passNo, pLog, rotation)
         const { promise, cancel } = runFfmpeg(ffmpeg, args, info.duration, (p) => {
           pushCompressProgress({
             videoId: item.id,
@@ -803,7 +1080,18 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
         UPDATE videos SET path = ?, filename = ?, size_bytes = ?, mtime = ?, updated_at = datetime('now')
         WHERE id = ?
       `).run(finalPath, path.basename(finalPath), fStat.size, Math.floor(fStat.mtimeMs), item.id)
-      // 缩略图 BLOB 内容仍对应同一画面，保留即可
+      // 旋转已烧录进画面，播放器的旋转角度归零（否则会二次旋转）
+      if (rotation) db.prepare('UPDATE videos SET rotation = 0 WHERE id = ?').run(item.id)
+      // 普通压缩不改变画面，旧缩略图保留即可；旋转压缩改变了画面方向
+      // （尤其 90/270 宽高对调），旧缩略图已不匹配 → 用旋转后的新文件重新抽帧。
+      // 刷新失败不阻断压缩结果（保留旧图，至少仍有画面）。
+      if (rotation) {
+        try {
+          await captureThumbBlob(ffmpeg, item.id, finalPath, (info.duration || 0) / 2)
+        } catch {
+          // 缩略图刷新失败忽略，不影响压缩成功结果
+        }
+      }
 
       return { ok: true, oldSize: oldStat.size, newSize: fStat.size }
     } catch (e: any) {
@@ -893,7 +1181,7 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     }
   }
 
-  ipcMain.handle('compress:start', async (_e, videos: { id: number; path: string; filename: string }[]) => {
+  ipcMain.handle('compress:start', async (_e, videos: { id: number; path: string; filename: string; rotation?: number; maxHeight?: number }[]) => {
     const ffmpeg = repo.getSetting(db, 'ffmpegPath')
     if (!ffmpeg) {
       await dialog.showMessageBox({
@@ -903,12 +1191,25 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       })
       return { started: false }
     }
-    const list = (videos ?? []).filter((v) => Number.isInteger(v.id) && v.path)
+    // 旋转角度归一化：任意输入四舍五入到 90° 步进，钳制到 0/90/180/270
+    const normRot = (r?: number): number => {
+      const n = Math.round((Number(r) || 0) / 90) * 90
+      return ((n % 360) + 360) % 360
+    }
+    const list = (videos ?? [])
+      .filter((v) => Number.isInteger(v.id) && v.path)
+      .map((v) => ({ ...v, rotation: normRot(v.rotation) }))
     if (list.length === 0) return { started: false }
 
     const cfg = loadCompressConfig()
+    const origHeight = cfg.maxHeight
+    // 任务可携带分辨率档位（旋转压缩入口选择）：首个非空档位覆盖本次执行并同步写回压缩参数
+    const reqHeight = list.find((v) => v.maxHeight != null && [0, 720, 1080, 1440].includes(v.maxHeight))?.maxHeight
+    if (reqHeight != null) cfg.maxHeight = reqHeight as CompressConfig['maxHeight']
     const enc = describeEncodeArgs(cfg)
     const qualityLabel = { high: '高画质', balanced: '均衡', small: '更小体积' }[cfg.quality]
+    const rotations = [...new Set(list.map((v) => v.rotation).filter((r) => r !== 0))]
+    const resLabel: Record<number, string> = { 0: '原分辨率', 1440: '2K（2560×1440）', 1080: '1080p', 720: '720p' }
     const { response } = await dialog.showMessageBox({
       type: 'question',
       buttons: ['取消', '开始压缩'],
@@ -922,11 +1223,19 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
         `${cfg.useGpu ? '显卡加速' : 'CPU'}\n` +
         `编码器：${enc.encoder}\n` +
         `参数：${enc.args}\n` +
+        `分辨率上限：${resLabel[cfg.maxHeight] ?? cfg.maxHeight}\n` +
+        (rotations.length > 0 ? `旋转：${rotations.join('°、')}°（烧录进画面，完成后播放旋转归零并自动重新生成缩略图）\n` : '') +
         (cfg.mode === 'size' && cfg.useGpu ? '（注：NVENC 不支持两遍编码，目标大小模式下退化为单遍）\n' : '') +
+        (reqHeight != null && cfg.maxHeight !== origHeight ? '（分辨率档位来自旋转压缩选择，将同步写回压缩参数）\n' : '') +
         '\n压缩在后台进行，可继续使用软件。完成后原文件会被删除，替换为压缩后的文件。\n' +
         '提示：压缩是有损的，建议确认重要视频已备份。',
     })
     if (response !== 1) return { started: false }
+
+    // 用户确认后：显式携带的分辨率档位同步写回压缩参数（供设置页与后续压缩默认使用）
+    if (reqHeight != null && cfg.maxHeight !== origHeight) {
+      repo.setSetting(db, 'compressConfig', JSON.stringify(cfg))
+    }
 
     queue = list
     cancelled = false

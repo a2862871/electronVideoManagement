@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useDialog } from './DialogProvider'
 import type { VideoDetailDto } from '../type/library'
 
 interface Props {
@@ -28,6 +29,7 @@ export default function VideoEditForm({ detail, onClose, onSaved }: Props) {
     tagNames: detail.tags.join(', '),
   })
   const [saving, setSaving] = useState(false)
+  const { alert } = useDialog()
 
   const set = (key: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
     setForm((f) => ({ ...f, [key]: e.target.value }))
@@ -36,7 +38,7 @@ export default function VideoEditForm({ detail, onClose, onSaved }: Props) {
 
   async function save() {
     setSaving(true)
-    await window.api.updateVideo({
+    const r = await window.api.updateVideo({
       id: detail.id,
       title: form.title || undefined,
       originaltitle: form.originaltitle || undefined,
@@ -53,6 +55,9 @@ export default function VideoEditForm({ detail, onClose, onSaved }: Props) {
       tagNames: split(form.tagNames),
     })
     setSaving(false)
+    if (r?.nfoError) {
+      await alert({ title: 'NFO 同步失败', message: `修改已保存到库，但写入 NFO 文件失败：${r.nfoError}`, danger: true })
+    }
     onSaved()
   }
 
@@ -63,6 +68,7 @@ export default function VideoEditForm({ detail, onClose, onSaved }: Props) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className='text-lg font-semibold text-slate-100'>编辑视频信息</div>
+        <div className='text-xs text-slate-500'>保存后若有同名 NFO 元数据文件，将同步写回。</div>
 
         <div>
           <label className={labelCls}>标题</label>

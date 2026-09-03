@@ -1,4 +1,4 @@
-import { app, BrowserWindow, screen, shell, ipcMain, protocol, Menu } from 'electron'
+import { app, BrowserWindow, screen, shell, ipcMain, protocol, Menu, dialog } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -126,10 +126,12 @@ async function createWindow() {
 /**
  * 解析数据目录（数据库 + 缩略图 BLOB 所在位置）：
  * 1) 运行目录下 database-dir.json 的 dir 字段非空 → 用它（跨开发版/打包版共用同一个库）
- * 2) 否则回落「运行目录\database」（打包后=exe 旁；开发模式=项目根）
+ * 2) 首次运行（无 database-dir.json）→ 弹目录选择框让用户指定存储位置；取消则用默认
+ * 3) 其余情况 → 回落「运行目录\database」（打包后=exe 旁；开发模式=项目根）
  * 配置目录不可创建（如 NAS 离线）时同样回落默认，保证应用总能启动。
+ * 选择结果（含取消）会写回引导文件，之后启动不再询问。
  */
-function resolveDataDir(): { dataDir: string; configFile: string } {
+async function resolveDataDir(): Promise<{ dataDir: string; configFile: string }> {
   const appRoot = app.isPackaged ? path.dirname(app.getPath('exe')) : app.getAppPath()
   const configFile = path.join(appRoot, 'database-dir.json')
   let configured: string | null = null
@@ -137,7 +139,17 @@ function resolveDataDir(): { dataDir: string; configFile: string } {
     const j = JSON.parse(readFileSync(configFile, 'utf-8'))
     if (typeof j.dir === 'string' && j.dir.trim()) configured = path.resolve(j.dir.trim())
   } catch {
-    // 无配置文件或格式不对 → 用默认目录
+    // 无配置文件或格式不对 → 用默认目录（下面按首次运行处理弹窗）
+  }
+  // 首次运行（引导文件不存在）：让用户自己选数据存储位置；取消/直接关闭则用默认
+  if (!existsSync(configFile)) {
+    const r = await dialog.showOpenDialog({
+      title: '选择数据存储位置（数据库与缩略图将保存到这里，取消则使用程序目录下的 database 文件夹）',
+      buttonLabel: '选择此目录',
+      defaultPath: appRoot,
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (!r.canceled && r.filePaths[0]) configured = path.resolve(r.filePaths[0])
   }
   const fallback = path.join(appRoot, 'database')
   let dataDir = configured ?? fallback
@@ -147,13 +159,11 @@ function resolveDataDir(): { dataDir: string; configFile: string } {
     dataDir = fallback
     mkdirSync(dataDir, { recursive: true })
   }
-  // 确保引导文件始终存在（electron-builder extraFiles 打包时需要它存在）
-  if (!existsSync(configFile)) {
-    try {
-      writeFileSync(configFile, JSON.stringify({ dir: configured ?? '' }, null, 2) + '\n')
-    } catch {
-      // 运行目录只读时跳过，不影响正常启动
-    }
+  // 写回引导文件（首次运行无论选没选都写：取消时空 dir 表示「用户已选择默认」，下次不再询问）
+  try {
+    writeFileSync(configFile, JSON.stringify({ dir: configured ?? '' }, null, 2) + '\n')
+  } catch {
+    // 运行目录只读时跳过，不影响正常启动（下次启动会再次询问）
   }
   return { dataDir, configFile }
 }
@@ -165,10 +175,10 @@ function broadcastFoldersChanged(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // 移除默认菜单栏（File/Edit/View 等）
   Menu.setApplicationMenu(null)
-  const { dataDir, configFile } = resolveDataDir()
+  const { dataDir, configFile } = await resolveDataDir() // 首次运行会弹目录选择框，需等待用户操作
   const db = openLibraryDb(path.join(dataDir, 'videolib.db'))
   repo.setSetting(db, 'dataDir', dataDir) // 供设置页展示当前库位置
   registerMediaProtocol()

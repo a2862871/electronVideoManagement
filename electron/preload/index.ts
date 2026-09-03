@@ -1,4 +1,5 @@
 import { ipcRenderer, contextBridge } from 'electron'
+import type { CompressProgress, DirMoveProgress } from '../../src/type/library'
 
 // --------- Expose some API to the Renderer process ---------
 contextBridge.exposeInMainWorld('ipcRenderer', {
@@ -29,6 +30,8 @@ contextBridge.exposeInMainWorld('api', {
   removeFolder: (id: number) => ipcRenderer.invoke('folder:remove', id),
   deleteDir: (dirPath: string) => ipcRenderer.invoke('dir:delete', dirPath),
   createDir: (args: { parentPath: string; name: string }) => ipcRenderer.invoke('dir:create', args),
+  /** 重命名子文件夹（磁盘改名 + 视频记录路径/sub_dir 同步），返回新路径 */
+  renameDir: (args: { dirPath: string; newName: string }) => ipcRenderer.invoke('dir:rename', args),
   toggleDirFavorite: (dirPath: string) => ipcRenderer.invoke('dir:toggleFavorite', dirPath),
   /** 移动整个文件夹（磁盘移动 + 数据库同步），返回移动的视频数 */
   moveDir: (args: { src: string; targetParent: string }) => ipcRenderer.invoke('dir:move', args),
@@ -58,6 +61,7 @@ contextBridge.exposeInMainWorld('api', {
   createActor: (name: string) => ipcRenderer.invoke('actors:create', name),
   cleanupEmptyActors: () => ipcRenderer.invoke('actors:cleanup'),
   mergeActors: (args: { targetId: number; sourceId: number }) => ipcRenderer.invoke('actors:merge', args),
+  deleteActor: (id: number) => ipcRenderer.invoke('actors:delete', id),
   openInPlayer: (filePath: string) => ipcRenderer.invoke('shell:openInPlayer', filePath),
   showInFolder: (filePath: string) => ipcRenderer.invoke('shell:showInFolder', filePath),
   getSetting: (key: string) => ipcRenderer.invoke('settings:get', key),
@@ -68,8 +72,8 @@ contextBridge.exposeInMainWorld('api', {
   grabFrame: (args: { videoPath: string; videoId: number; timeSec: number }) => ipcRenderer.invoke('ffmpeg:grabFrame', args),
   getCompressConfig: () => ipcRenderer.invoke('compress:getConfig'),
   setCompressConfig: (cfg: unknown) => ipcRenderer.invoke('compress:setConfig', cfg),
-  /** 开始后台压缩（串行队列），完成后用新文件替换原文件 */
-  startCompress: (videos: { id: number; path: string; filename: string }[]) =>
+  /** 开始后台压缩（串行队列），完成后用新文件替换原文件；rotation 为可选的烧录旋转角度，maxHeight 为可选的分辨率上限档位（旋转压缩选择，覆盖本次并同步写回压缩参数） */
+  startCompress: (videos: { id: number; path: string; filename: string; rotation?: number; maxHeight?: number }[]) =>
     ipcRenderer.invoke('compress:start', videos),
   cancelCompress: () => ipcRenderer.invoke('compress:cancel'),
   onCompressProgress: (cb: (p: CompressProgress) => void) => {
@@ -83,6 +87,12 @@ contextBridge.exposeInMainWorld('api', {
     const listener = (_event: unknown, p: { done: number; total: number; current: string }) => cb(p)
     ipcRenderer.on('ffmpeg:batchMedia:progress', listener as never)
     return () => ipcRenderer.off('ffmpeg:batchMedia:progress', listener as never)
+  },
+  /** 订阅移动文件夹进度（跨盘复制大目录可能很慢），返回取消订阅函数 */
+  onDirMoveProgress: (cb: (p: DirMoveProgress) => void) => {
+    const listener = (_event: unknown, p: DirMoveProgress) => cb(p)
+    ipcRenderer.on('dir:move:progress', listener as never)
+    return () => ipcRenderer.off('dir:move:progress', listener as never)
   },
   moveVideo: (args: { id: number; targetDir: string }) => ipcRenderer.invoke('video:move', args),
   renameVideo: (args: { id: number; newName: string }) => ipcRenderer.invoke('video:rename', args),

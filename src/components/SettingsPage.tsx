@@ -586,12 +586,12 @@ function CompressSection() {
             <select
               className={inputCls}
               value={compress.maxHeight}
-              onChange={(e) => updateCompress({ maxHeight: Number(e.target.value) as 0 | 1080 | 720 | 480 })}
+              onChange={(e) => updateCompress({ maxHeight: Number(e.target.value) as 0 | 1440 | 1080 | 720 })}
             >
               <option value={0}>保持原始</option>
+              <option value={1440}>限制到 2K（2560×1440）</option>
               <option value={1080}>限制到 1080p</option>
               <option value={720}>限制到 720p</option>
-              <option value={480}>限制到 480p</option>
             </select>
             <div className='mt-1 text-xs text-slate-500'>降分辨率是省体积最有效的手段。</div>
           </div>

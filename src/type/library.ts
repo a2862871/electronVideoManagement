@@ -117,7 +117,8 @@ export interface BatchUpdateArgs {
   studio?: string
   series?: string
   releasedate?: string
-  rating?: number
+  /** null = 清除评分（「留空则清除」） */
+  rating?: number | null
   /** 追加模式：不覆盖已有演员，仅补充缺失的 */
   addActors?: string[]
   /** 追加模式：不覆盖已有标签，仅补充缺失的 */
@@ -150,8 +151,8 @@ export interface CompressConfig {
   targetMB: number
   /** 编码速度，越慢体积越小（CPU + crf 模式生效） */
   preset: 'medium' | 'slow' | 'slower' | 'veryslow'
-  /** 分辨率上限，0=保持原始 */
-  maxHeight: 0 | 1080 | 720 | 480
+  /** 分辨率上限，0=保持原始；1440=2K（2560×1440） */
+  maxHeight: 0 | 1440 | 1080 | 720
   /** 帧率上限，0=保持原始 */
   maxFps: 0 | 60 | 30 | 24
   /** 音频码率 kbps */
@@ -223,6 +224,21 @@ export interface BatchThumbProgress {
   current: string
 }
 
+/** 移动文件夹进度（主进程通过 dir:move:progress 推送） */
+export interface DirMoveProgress {
+  /** scan=统计源目录规模；move=磁盘移动中；done=全部完成；error=失败 */
+  phase: 'scan' | 'move' | 'done' | 'error'
+  /** 0-100（done 恒为 100；按已复制字节估算） */
+  percent: number
+  doneFiles: number
+  totalFiles: number
+  doneBytes: number
+  totalBytes: number
+  /** 当前正在移动的文件名 */
+  current: string
+  error?: string
+}
+
 export interface LibraryApi {
   listFolders(): Promise<WatchFolderDto[]>
   listDirs(dirPath: string): Promise<DirEntryDto[]>
@@ -232,6 +248,8 @@ export interface LibraryApi {
   removeFolder(id: number): Promise<void>
   deleteDir(dirPath: string): Promise<{ ok: boolean; removedVideos?: number; error?: string }>
   createDir(args: { parentPath: string; name: string }): Promise<{ ok: boolean; path?: string; error?: string }>
+  /** 重命名子文件夹（磁盘改名 + 视频记录路径/sub_dir 同步）；renamed=false 表示名称未变化 */
+  renameDir(args: { dirPath: string; newName: string }): Promise<{ ok: boolean; renamed?: boolean; path?: string; moved?: number; error?: string }>
   /** 切换目录收藏状态，返回切换后是否为收藏 */
   toggleDirFavorite(dirPath: string): Promise<boolean>
   /** 移动整个文件夹到新的父目录（磁盘移动 + 数据库同步），返回移动的视频数 */
@@ -248,8 +266,11 @@ export interface LibraryApi {
   scan(args?: { folderId?: number; dirPath?: string }): Promise<ScanSummaryDto[]>
   queryVideos(q: VideoQuery): Promise<VideoPageDto>
   getVideo(id: number): Promise<VideoDetailDto | null>
-  updateVideo(args: VideoUpdateArgs): Promise<void>
-  batchUpdateVideos(args: BatchUpdateArgs): Promise<number>
+  /** 设置画面旋转角度（90° 步进），持久化到数据库 */
+  setVideoRotation(args: { id: number; rotation: number }): Promise<void>
+  /** 保存后若有同名 NFO 会同步写回；nfoError = NFO 写入失败信息（数据库已保存成功） */
+  updateVideo(args: VideoUpdateArgs): Promise<{ ok: boolean; nfoError?: string }>
+  batchUpdateVideos(args: BatchUpdateArgs): Promise<{ count: number; nfoError?: string }>
   listTags(): Promise<TagDto[]>
   createTag(name: string): Promise<number>
   renameTag(args: { id: number; name: string }): Promise<boolean>
@@ -259,6 +280,8 @@ export interface LibraryApi {
   createActor(name: string): Promise<{ ok: boolean; created?: boolean; id?: number; error?: string }>
   cleanupEmptyActors(): Promise<number>
   mergeActors(args: { targetId: number; sourceId: number }): Promise<{ ok: boolean; cancelled?: boolean; count?: number; error?: string }>
+  /** 删除演员（仅演员记录与作品关联，不影响视频），返回解除的关联数 */
+  deleteActor(id: number): Promise<number>
   openInPlayer(filePath: string): Promise<string>
   showInFolder(filePath: string): Promise<void>
   getSetting(key: string): Promise<string | null>
@@ -272,12 +295,14 @@ export interface LibraryApi {
   batchCompleteMedia(videos: BatchThumbItem[]): Promise<BatchThumbResult>
   /** 订阅一键补全进度，返回取消订阅函数 */
   onBatchMediaProgress(cb: (p: BatchThumbProgress) => void): () => void
+  /** 订阅移动文件夹进度（跨盘复制大目录可能很慢），返回取消订阅函数 */
+  onDirMoveProgress(cb: (p: DirMoveProgress) => void): () => void
   /** 读取视频压缩配置 */
   getCompressConfig(): Promise<CompressConfig>
   /** 保存视频压缩配置 */
   setCompressConfig(cfg: CompressConfig): Promise<void>
-  /** 开始后台压缩（串行队列），完成后用新文件替换原文件 */
-  startCompress(videos: { id: number; path: string; filename: string }[]): Promise<{ started: boolean; count?: number }>
+  /** 开始后台压缩（串行队列），完成后用新文件替换原文件；rotation 为可选的烧录旋转角度（0/90/180/270），maxHeight 为可选的分辨率上限档位（0/720/1080/1440，旋转压缩选择，覆盖本次并同步写回压缩参数） */
+  startCompress(videos: { id: number; path: string; filename: string; rotation?: number; maxHeight?: number }[]): Promise<{ started: boolean; count?: number }>
   /** 取消进行中的压缩任务 */
   cancelCompress(): Promise<void>
   /** 订阅压缩进度，返回取消订阅函数 */

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useDialog } from './DialogProvider'
+import ContextMenu from './ContextMenu'
 import type { ActorDto, DirEntryDto, WatchFolderDto } from '../type/library'
 import { VIDEO_DND_MIME } from './VideoGrid'
 
@@ -34,7 +35,8 @@ export interface VideoDndPayload {
 
 interface Props {
   folders: WatchFolderDto[]
-  filters: Filters
+  /** null = 尚未选择任何目录（不点亮「全部视频」，App 也不加载视频列表） */
+  filters: Filters | null
   onChange(filters: Filters): void
   onManageActors(): void
   onManageTags(): void
@@ -101,6 +103,7 @@ function Column({
   refreshKey = 0,
   onSelect,
   onDeleted,
+  onRenamed,
   onMoveDir,
   onDropVideos,
   onResize,
@@ -115,6 +118,8 @@ function Column({
   refreshKey?: number
   onSelect(path: string): void
   onDeleted?(): void
+  /** 目录被重命名后回调（oldPath → newPath），供父级同步当前浏览路径 */
+  onRenamed?(oldPath: string, newPath: string): void
   onMoveDir?(src: string): void
   onDropVideos?(payload: VideoDndPayload, dirPath: string): void
   onResize(newWidth: number): void
@@ -133,6 +138,10 @@ function Column({
   const [createOpen, setCreateOpen] = useState(false)
   const [createInput, setCreateInput] = useState('')
   const [creating, setCreating] = useState(false)
+  // 重命名文件夹对话框
+  const [renameDir, setRenameDir] = useState<DirEntryDto | null>(null)
+  const [renameInput, setRenameInput] = useState('')
+  const [renaming, setRenaming] = useState(false)
   // 拖放悬停高亮：当前拖拽经过的目录路径（空白处 = basePath）
   const [dropHover, setDropHover] = useState<string | null>(null)
   // 手动目录顺序（settings.dirOrders）与排序拖拽状态
@@ -220,6 +229,27 @@ function Column({
     setCreateOpen(false)
     setCreateInput('')
     load()
+  }
+
+  /** 重命名：磁盘改名 + 后端同步视频记录路径。成功后刷新本栏并通知父级同步浏览路径。 */
+  async function doRename() {
+    const dir = renameDir
+    if (!dir) return
+    const n = renameInput.trim()
+    if (!n) return
+    setRenaming(true)
+    const r = await window.api.renameDir({ dirPath: dir.path, newName: n })
+    setRenaming(false)
+    if (!r.ok) {
+      await alert({ title: '重命名失败', message: r.error ?? '未知错误', danger: true })
+      return // 保留对话框让用户修正
+    }
+    const oldPath = dir.path
+    const newPath = r.path ?? ''
+    setRenameDir(null)
+    if (r.renamed === false) return
+    load()
+    onRenamed?.(oldPath, newPath)
   }
 
   // 拖放辅助：仅接受 VideoLib 视频卡片的拖拽
@@ -412,73 +442,78 @@ function Column({
         </button>
       ))}
 
-      {/* 右键菜单 */}
+      {/* 右键菜单（portal 到 body，避免被侧边栏裁剪/错位） */}
       {menu && (
-        <>
-          <div className='fixed inset-0 z-50' onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }} />
-          <div
-            className='fixed z-[51] w-44 overflow-hidden rounded-xl border border-slate-700 bg-slate-900 py-1 shadow-2xl'
-            style={{ left: Math.min(menu.x, window.innerWidth - 180), top: Math.min(menu.y, window.innerHeight - 100) }}
+        <ContextMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)} className='w-44'>
+          <button
+            className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+            onClick={() => {
+              setCreateInput('')
+              setCreateOpen(true)
+              setMenu(null)
+            }}
           >
+            新建文件夹…
+          </button>
+          {dirOrder.length > 0 && (
             <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+              className='block w-full px-4 py-2 text-left text-sm text-slate-300 hover:bg-slate-800'
               onClick={() => {
-                setCreateInput('')
-                setCreateOpen(true)
+                saveDirOrder([])
                 setMenu(null)
               }}
             >
-              新建文件夹…
+              恢复名称排序
             </button>
-            {dirOrder.length > 0 && (
+          )}
+          {menu.dir && (
+            <>
               <button
-                className='block w-full px-4 py-2 text-left text-sm text-slate-300 hover:bg-slate-800'
+                className='block w-full px-4 py-2 text-left text-sm text-amber-300 hover:bg-slate-800'
                 onClick={() => {
-                  saveDirOrder([])
+                  const dir = menu.dir!
                   setMenu(null)
+                  toggleFavorite(dir)
                 }}
               >
-                恢复名称排序
+                {menu.dir.favorite ? '取消收藏' : '收藏文件夹'}
               </button>
-            )}
-            {menu.dir && (
-              <>
+              {onMoveDir && (
                 <button
-                  className='block w-full px-4 py-2 text-left text-sm text-amber-300 hover:bg-slate-800'
+                  className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
                   onClick={() => {
                     const dir = menu.dir!
                     setMenu(null)
-                    toggleFavorite(dir)
+                    onMoveDir(dir.path)
                   }}
                 >
-                  {menu.dir.favorite ? '取消收藏' : '收藏文件夹'}
+                  移动文件夹…
                 </button>
-                {onMoveDir && (
-                  <button
-                    className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-                    onClick={() => {
-                      const dir = menu.dir!
-                      setMenu(null)
-                      onMoveDir(dir.path)
-                    }}
-                  >
-                    移动文件夹…
-                  </button>
-                )}
-                <button
-                  className='block w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-red-950/60'
-                  onClick={() => {
-                    const dir = menu.dir!
-                    setMenu(null)
-                    requestDelete(dir)
-                  }}
-                >
-                  {(menu.dir.count ?? 0) === 0 ? '删除空文件夹' : '删除整个文件夹…'}
-                </button>
-              </>
-            )}
-          </div>
-        </>
+              )}
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const dir = menu.dir!
+                  setMenu(null)
+                  setRenameDir(dir)
+                  setRenameInput(dir.name)
+                }}
+              >
+                重命名文件夹…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-red-950/60'
+                onClick={() => {
+                  const dir = menu.dir!
+                  setMenu(null)
+                  requestDelete(dir)
+                }}
+              >
+                {(menu.dir.count ?? 0) === 0 ? '删除空文件夹' : '删除整个文件夹…'}
+              </button>
+            </>
+          )}
+        </ContextMenu>
       )}
 
       {/* 新建文件夹对话框 */}
@@ -508,6 +543,43 @@ function Column({
                 onClick={doCreate}
               >
                 {creating ? '创建中…' : '创建'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 重命名文件夹对话框 */}
+      {renameDir && (
+        <div className='fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-6'>
+          <div className='w-full max-w-md space-y-4 rounded-2xl border border-slate-700 bg-slate-950 p-5'>
+            <div className='text-lg font-semibold text-slate-100'>重命名文件夹</div>
+            <div className='truncate text-xs text-slate-500'>{renameDir.path}</div>
+            <input
+              className='w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-100 focus:border-cyan-500 focus:outline-none'
+              placeholder='文件夹名'
+              value={renameInput}
+              autoFocus
+              onFocus={(e) => e.target.select()}
+              onChange={(e) => setRenameInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && renameInput.trim() && !renaming && doRename()}
+            />
+            <div className='text-xs leading-relaxed text-slate-500'>
+              将同步更新该文件夹下全部视频的路径记录（包含子文件夹），正在浏览该目录时视图会自动跟随新路径。
+            </div>
+            <div className='flex justify-end gap-2'>
+              <button
+                className='rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-900'
+                onClick={() => { setRenameDir(null); setRenameInput('') }}
+              >
+                取消
+              </button>
+              <button
+                className='btn-primary rounded-lg px-4 py-2 text-sm font-medium text-white disabled:opacity-40'
+                disabled={!renameInput.trim() || renameInput.trim() === renameDir.name || renaming}
+                onClick={doRename}
+              >
+                {renaming ? '重命名中…' : '确认重命名'}
               </button>
             </div>
           </div>
@@ -746,44 +818,38 @@ function ActorColumn({
         </button>
       ))}
 
-      {/* 右键菜单 */}
+      {/* 右键菜单（portal 到 body，避免被侧边栏裁剪/错位） */}
       {menu && (
-        <>
-          <div className='fixed inset-0 z-50' onClick={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }} />
-          <div
-            className='fixed z-[51] w-44 overflow-hidden rounded-xl border border-slate-700 bg-slate-900 py-1 shadow-2xl'
-            style={{ left: Math.min(menu.x, window.innerWidth - 180), top: Math.min(menu.y, window.innerHeight - 100) }}
-          >
-            {menu.actor ? (
+        <ContextMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)} className='w-44'>
+          {menu.actor ? (
+            <button
+              className='block w-full px-4 py-2 text-left text-sm text-amber-300 hover:bg-slate-800'
+              onClick={() => {
+                const a = menu.actor!
+                setMenu(null)
+                toggleFavorite(a)
+              }}
+            >
+              {menu.actor.favorite ? '取消收藏' : '收藏演员'}
+            </button>
+          ) : (
+            order.length > 0 && (
               <button
-                className='block w-full px-4 py-2 text-left text-sm text-amber-300 hover:bg-slate-800'
-                onClick={() => {
-                  const a = menu.actor!
-                  setMenu(null)
-                  toggleFavorite(a)
-                }}
+                className='block w-full px-4 py-2 text-left text-sm text-slate-300 hover:bg-slate-800'
+                onClick={() => { saveOrder([]); setMenu(null) }}
               >
-                {menu.actor.favorite ? '取消收藏' : '收藏演员'}
+                恢复名称排序
               </button>
-            ) : (
-              order.length > 0 && (
-                <button
-                  className='block w-full px-4 py-2 text-left text-sm text-slate-300 hover:bg-slate-800'
-                  onClick={() => { saveOrder([]); setMenu(null) }}
-                >
-                  恢复名称排序
-                </button>
-              )
-            )}
-          </div>
-        </>
+            )
+          )}
+        </ContextMenu>
       )}
     </div>
   )
 }
 
 export default function Sidebar({ folders, filters, onChange, onManageActors, onManageTags, onOpenSettings, onDirDeleted, onMoveDir, onDropVideos, refreshSignal }: Props) {
-  const folder = folders.find((f) => f.id === filters.folderId)
+  const folder = folders.find((f) => f.id === filters?.folderId)
   // 主目录按钮的拖放悬停高亮（拖到监控文件夹根 = 移到该文件夹根目录）
   const [dropFolder, setDropFolder] = useState<string | null>(null)
   // —— 主目录手动排序（拖拽重排，settings.folderOrders 持久化）——
@@ -804,7 +870,7 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
 
   // 由 dirPath 还原逐级链路，用于渲染并列分栏
   const chain: { name: string; path: string }[] = []
-  if (folder && filters.dirPath && filters.dirPath.startsWith(folder.path)) {
+  if (folder && filters?.dirPath && filters.dirPath.startsWith(folder.path)) {
     const sep = filters.dirPath.includes('\\') ? '\\' : '/'
     const rel = filters.dirPath.slice(folder.path.length).replace(/^[\\/]/, '')
     let acc = folder.path
@@ -827,6 +893,15 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
   async function handleDropVideos(payload: VideoDndPayload, dirPath: string) {
     await onDropVideos?.(payload, dirPath)
     setDirRefreshKey((k) => k + 1)
+  }
+
+  /** 子目录被重命名后：若当前浏览路径在旧目录之下，切到新路径（触发右侧列表与目录链刷新） */
+  function handleDirRenamed(oldPath: string, newPath: string) {
+    if (!newPath) return
+    const cur = filters?.dirPath
+    if (cur && (cur === oldPath || cur.startsWith(oldPath + '\\') || cur.startsWith(oldPath + '/'))) {
+      onChange({ ...filters, dirPath: newPath + cur.slice(oldPath.length) })
+    }
   }
 
   // 启动时读取手动主目录顺序（settings.folderOrders）
@@ -932,7 +1007,7 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
         />
         <div>
           <button
-            className={itemCls(!filters.folderId && !filters.tagIds?.length && !filters.dirPath)}
+            className={itemCls(filters !== null && !filters.folderId && !filters.tagIds?.length && !filters.dirPath)}
             onClick={() => onChange({})}
           >
             全部视频
@@ -943,7 +1018,7 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
           {sortedFolders.map((f) => (
             <button
               key={f.id}
-              className={`${itemCls(filters.folderId === f.id)} ${dropFolder === f.path ? 'ring-1 ring-cyan-400' : ''} ${folderDropLine === `-${f.id}` ? 'shadow-[inset_0_2px_0_#22d3ee]' : ''} ${folderDropLine === `+${f.id}` ? 'shadow-[inset_0_-2px_0_#22d3ee]' : ''} ${folderDragId === f.id ? 'opacity-40' : ''}`}
+              className={`${itemCls(filters?.folderId === f.id)} ${dropFolder === f.path ? 'ring-1 ring-cyan-400' : ''} ${folderDropLine === `-${f.id}` ? 'shadow-[inset_0_2px_0_#22d3ee]' : ''} ${folderDropLine === `+${f.id}` ? 'shadow-[inset_0_-2px_0_#22d3ee]' : ''} ${folderDragId === f.id ? 'opacity-40' : ''}`}
               title={f.path}
               data-drop={f.path}
               data-folder={f.id}
@@ -955,7 +1030,7 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
                 setFolderDragId(f.id)
               }}
               onDragEnd={() => { setFolderDragId(null); setFolderDropLine(null) }}
-              onClick={() => onChange({ folderId: f.id, actorId: filters.actorId, tagIds: filters.tagIds })}
+              onClick={() => onChange({ folderId: f.id, actorId: filters?.actorId, tagIds: filters?.tagIds })}
             >
               {f.name}
               {f.tagName ? <span className='ml-1 text-xs opacity-60'>#{f.tagName}</span> : null}
@@ -980,7 +1055,7 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
       {isActorMode && folder && (
         <ActorColumn
           folderId={folder.id}
-          activeActorId={filters.actorId}
+          activeActorId={filters?.actorId}
           width={colWidths['actor'] ?? COL_WIDTH_DEFAULT}
           refreshKey={dirRefreshKey + (refreshSignal ?? 0)}
           onSelect={(actorId) =>
@@ -1003,8 +1078,9 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
             width={colWidths[wKey] ?? COL_WIDTH_DEFAULT}
             filterable={i === 0}
             refreshKey={dirRefreshKey + (refreshSignal ?? 0)}
-            onSelect={(p) => onChange({ folderId: filters.folderId, dirPath: p })}
+            onSelect={(p) => onChange({ folderId: filters?.folderId, dirPath: p })}
             onDeleted={onDirDeleted}
+            onRenamed={handleDirRenamed}
             onMoveDir={onMoveDir}
             onDropVideos={handleDropVideos}
             onResize={(w) => setColWidths((prev) => ({ ...prev, [wKey]: w }))}

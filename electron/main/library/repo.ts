@@ -45,9 +45,10 @@ export function ensureTag(db: DatabaseSync, name: string): number {
 }
 
 export function ensureActor(db: DatabaseSync, name: string): number {
-  const existing = db.prepare('SELECT id FROM actors WHERE name = ?').get(name) as { id: number } | undefined
+  const n = name.trim()
+  const existing = db.prepare('SELECT id FROM actors WHERE name = ?').get(n) as { id: number } | undefined
   if (existing) return existing.id
-  const r = db.prepare('INSERT INTO actors(name) VALUES (?)').run(name)
+  const r = db.prepare('INSERT INTO actors(name) VALUES (?)').run(n)
   return Number(r.lastInsertRowid)
 }
 
@@ -87,6 +88,13 @@ export function mergeActor(db: DatabaseSync, targetId: number, sourceId: number)
   db.prepare('DELETE FROM actors WHERE id = ?').run(sourceId)
   const r = db.prepare('SELECT COUNT(*) AS c FROM video_actors WHERE actor_id = ?').get(targetId) as { c: number }
   return r.c
+}
+
+/** 删除演员：仅移除演员记录及其与视频的关联，返回解除的关联数；视频本身不受影响。 */
+export function deleteActor(db: DatabaseSync, id: number): number {
+  const r = db.prepare('DELETE FROM video_actors WHERE actor_id = ?').run(id)
+  db.prepare('DELETE FROM actors WHERE id = ?').run(id)
+  return Number(r.changes)
 }
 
 export function getVideoByPath(db: DatabaseSync, filePath: string): VideoRow | undefined {
@@ -208,5 +216,6 @@ export function setSetting(db: DatabaseSync, key: string, value: string): void {
 }
 
 export function listWatchFolders(db: DatabaseSync): WatchFolderRow[] {
-  return db.prepare('SELECT * FROM watch_folders ORDER BY id').all() as WatchFolderRow[]
+  // better-sqlite3 的行类型与接口无充分重叠，需经 unknown 中转断言
+  return db.prepare('SELECT * FROM watch_folders ORDER BY id').all() as unknown as WatchFolderRow[]
 }

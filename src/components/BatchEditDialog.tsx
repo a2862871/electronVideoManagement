@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { VideoDetailDto } from '../type/library'
+import type { BatchUpdateArgs, VideoDetailDto } from '../type/library'
 
 interface Props {
   /** 要批量编辑的视频 ID 列表（当前列表的全部视频） */
@@ -37,14 +37,14 @@ export default function BatchEditDialog({ videoIds, onClose, onDone }: Props) {
   const [applyTags, setApplyTags] = useState(false)
 
   const [saving, setSaving] = useState(false)
-  const [result, setResult] = useState<string | null>(null)
+  const [result, setResult] = useState<{ count: number; nfoError?: string } | null>(null)
 
   const split = (s: string) => s.split(/[,，]/).map((x) => x.trim()).filter(Boolean)
   const noneApplied = !applySubDir && !applyStudio && !applySeries && !applyReleaseDate && !applyRating && !applyActors && !applyTags
 
   async function save() {
     setSaving(true)
-    const args: Record<string, unknown> = { ids: videoIds }
+    const args: BatchUpdateArgs = { ids: videoIds }
     if (applySubDir) args.sub_dir = subDir.trim()
     if (applyStudio) args.studio = studio.trim()
     if (applySeries) args.series = series.trim()
@@ -60,9 +60,9 @@ export default function BatchEditDialog({ videoIds, onClose, onDone }: Props) {
       if (tagMode === 'set') args.setTags = names
       else args.addTags = names
     }
-    const count = await window.api.batchUpdateVideos(args)
+    const r = await window.api.batchUpdateVideos(args)
     setSaving(false)
-    setResult(`已更新 ${count} 个视频。`)
+    setResult(r)
     onDone()
   }
 
@@ -93,7 +93,12 @@ export default function BatchEditDialog({ videoIds, onClose, onDone }: Props) {
         </div>
 
         {result ? (
-          <div className='py-6 text-center text-sm text-cyan-400'>{result}</div>
+          <div className='py-6 text-center text-sm'>
+            <div className='text-cyan-400'>已更新 {result.count} 个视频。</div>
+            {result.nfoError && (
+              <div className='mt-2 text-red-400'>部分 NFO 文件同步失败：{result.nfoError}</div>
+            )}
+          </div>
         ) : (
           <>
             <div className='space-y-3 rounded-lg border border-slate-800 p-3'>

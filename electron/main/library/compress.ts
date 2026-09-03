@@ -24,8 +24,8 @@ export interface CompressConfig {
   targetMB: number
   /** 编码速度（CPU + crf 模式生效） */
   preset: PresetKey
-  /** 分辨率上限（0=保持原始） */
-  maxHeight: 0 | 1080 | 720 | 480
+  /** 分辨率上限（0=保持原始；1440=2K/2560×1440） */
+  maxHeight: 0 | 1440 | 1080 | 720
   /** 帧率上限（0=保持原始） */
   maxFps: 0 | 60 | 30 | 24
   /** 音频码率 kbps */
@@ -185,7 +185,7 @@ export async function probeVideo(ffmpeg: string, ffprobe: string | null, file: s
   return probeByFfmpeg(ffmpeg, file)
 }
 
-/** 构造 ffmpeg 参数（passNo: 0=单遍, 1=两遍之分析, 2=两遍之编码）。 */
+/** 构造 ffmpeg 参数（passNo: 0=单遍, 1=两遍之分析, 2=两遍之编码；rotation: 烧录旋转角度 0/90/180/270）。 */
 export function buildArgs(
   src: string,
   dst: string,
@@ -193,6 +193,7 @@ export function buildArgs(
   cfg: CompressConfig,
   passNo = 0,
   passLog = '',
+  rotation = 0,
 ): string[] {
   const spec = CODECS[cfg.codec]
   const useGpu = cfg.useGpu && !!spec.gpu
@@ -201,10 +202,15 @@ export function buildArgs(
   const args = ['-y', '-hide_banner', '-loglevel', 'error', '-nostats', '-progress', 'pipe:1', '-i', src]
   if (passNo) args.push('-pass', String(passNo), '-passlogfile', passLog)
 
-  // 滤镜：帧率限制 + 分辨率限制（并保证宽高为偶数）
+  // 滤镜：旋转（烧录进画面）+ 帧率限制 + 分辨率限制（并保证宽高为偶数）
   const vf: string[] = []
+  if (rotation === 90) vf.push('transpose=1')
+  else if (rotation === 180) vf.push('transpose=1,transpose=1')
+  else if (rotation === 270) vf.push('transpose=2')
+  // 旋转 90/270 后输出高度 = 原始宽度，分辨率上限按旋转后的高度判断
+  const outH = rotation === 90 || rotation === 270 ? info.width : info.height
   if (cfg.maxFps && info.fps > cfg.maxFps + 0.05) vf.push(`fps=${cfg.maxFps}`)
-  if (cfg.maxHeight && info.height > cfg.maxHeight) vf.push(`scale=w=-2:h=${cfg.maxHeight}:flags=lanczos`)
+  if (cfg.maxHeight && outH > cfg.maxHeight) vf.push(`scale=w=-2:h=${cfg.maxHeight}:flags=lanczos`)
   if (vf.length) vf.push('scale=w=trunc(iw/2)*2:h=trunc(ih/2)*2')
   if (vf.length) args.push('-vf', vf.join(','))
 

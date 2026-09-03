@@ -2,7 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ActorPage from './components/ActorPage'
 import BatchEditDialog from './components/BatchEditDialog'
 import CaptureDialog from './components/CaptureDialog'
+import ContextMenu from './components/ContextMenu'
+import MoveDirToast from './components/MoveDirToast'
 import RenameDialog from './components/RenameDialog'
+import RotateCompressDialog from './components/RotateCompressDialog'
 import SettingsPage from './components/SettingsPage'
 import Sidebar, { type Filters } from './components/Sidebar'
 import TagPage from './components/TagPage'
@@ -11,7 +14,7 @@ import VideoEditForm from './components/VideoEditForm'
 import VideoGrid, { DEFAULT_COVER_H, groupByWork } from './components/VideoGrid'
 import VideoTable from './components/VideoTable'
 import { formatSizeGB } from './utils/media'
-import type { ActorDto, CompressProgress, TagDto, VideoDetailDto, VideoDto, WatchFolderDto } from './type/library'
+import type { ActorDto, CompressProgress, DirMoveProgress, TagDto, VideoDetailDto, VideoDto, WatchFolderDto } from './type/library'
 
 const PAGE_SIZE = 60
 
@@ -20,8 +23,11 @@ export default function App() {
   const [folders, setFolders] = useState<WatchFolderDto[]>([])
   const [tags, setTags] = useState<TagDto[]>([])
   const [actors, setActors] = useState<ActorDto[]>([])
-  const [filters, setFilters] = useState<Filters>({})
+  // null = 尚未选择任何目录（启动时不加载视频列表，也不点亮「全部视频」）
+  const [filters, setFilters] = useState<Filters | null>(null)
   const [search, setSearch] = useState('')
+  // 预览区顶部「目录内搜索」：与全局搜索独立，结果限定在当前浏览的子目录内
+  const [dirSearch, setDirSearch] = useState('')
   const [sort, setSort] = useState<'newest' | 'oldest' | 'name'>('newest')
   const [rows, setRows] = useState<VideoDto[]>([])
   const [total, setTotal] = useState(0)
@@ -35,6 +41,8 @@ export default function App() {
   const [editVideo, setEditVideo] = useState<VideoDetailDto | null>(null)
   const [captureVideo, setCaptureVideo] = useState<{ videoPath: string; videoId: number } | null>(null)
   const [renameVideo, setRenameVideo] = useState<{ videoId: number; filename: string } | null>(null)
+  // 旋转压缩：待处理的一个或多个视频（对话框中输入角度后按当前压缩配置压缩并烧录旋转）
+  const [rotateCompressVideos, setRotateCompressVideos] = useState<VideoDto[] | null>(null)
   const [showBatchEdit, setShowBatchEdit] = useState(false)
   const [view, setView] = useState<'library' | 'tags' | 'actors' | 'settings'>('library')
   // 目录栏外部刷新信号（文件监听/窗口聚焦触发）
@@ -61,10 +69,14 @@ export default function App() {
   const [compressList, setCompressList] = useState<CompressProgress[]>([])
   // 是否展开剩余待压缩文件列表
   const [showRemaining, setShowRemaining] = useState(false)
+  // 移动文件夹进度（右下角浮窗；跨盘复制大目录时提供可见反馈）
+  const [dirMove, setDirMove] = useState<DirMoveProgress | null>(null)
 
   const hasApi = typeof window.api !== 'undefined'
   const mainRef = useRef<HTMLElement>(null)
   const sentinelRef = useRef<HTMLDivElement>(null)
+  // 移动文件夹浮窗自动收起定时器
+  const dirMoveHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const reloadMeta = useCallback(async () => {
     const [f, t, a] = await Promise.all([window.api.listFolders(), window.api.listTags(), window.api.listActors()])
@@ -84,6 +96,20 @@ export default function App() {
     })
   }, [view])
 
+  // 订阅移动文件夹进度：完成/失败后延时自动收起右下角浮窗
+  useEffect(() => {
+    const off = window.api.onDirMoveProgress((p) => {
+      if (dirMoveHideTimer.current) clearTimeout(dirMoveHideTimer.current)
+      setDirMove(p)
+      if (p.phase === 'done') dirMoveHideTimer.current = setTimeout(() => setDirMove(null), 2500)
+      else if (p.phase === 'error') dirMoveHideTimer.current = setTimeout(() => setDirMove(null), 8000)
+    })
+    return () => {
+      off()
+      if (dirMoveHideTimer.current) clearTimeout(dirMoveHideTimer.current)
+    }
+  }, [])
+
   // 切换视图模式并持久化（立即生效）
   async function changeViewMode(mode: 'grid' | 'list') {
     setViewMode(mode)
@@ -91,20 +117,32 @@ export default function App() {
   }
 
   const reloadVideos = useCallback(async (offset = 0) => {
+    const kw = search.trim()
+    const dirKw = dirSearch.trim()
+    // 全局搜索开启时优先（结果 = 主目录，忽略子目录/演员/标签）；
+    // 否则若有目录内搜索词，则与当前目录路径（及演员/标签筛选）叠加。
+    const globalSearch = kw !== ''
+    const dirScopeSearch = !globalSearch && dirKw !== ''
+    // 未选择任何目录（且无搜索词）时不查询：主区域保持为空，选中目录后才列出视频
+    if (filters === null && !kw && !dirKw) {
+      setRows([])
+      setTotal(0)
+      return
+    }
     const page = await window.api.queryVideos({
-      search: search || undefined,
-      folderId: filters.folderId,
-      // 有搜索词时只按主目录限定范围：忽略演员/标签/子目录筛选（搜索结果 = 主目录）
-      tagIds: search ? undefined : filters.tagIds,
-      actorId: search ? undefined : filters.actorId,
-      dirPath: search ? undefined : filters.dirPath,
+      search: dirScopeSearch ? dirKw : kw || undefined,
+      folderId: filters?.folderId,
+      // 全局搜索时只按主目录限定范围：忽略演员/标签/子目录筛选（搜索结果 = 主目录）
+      tagIds: globalSearch ? undefined : filters?.tagIds,
+      actorId: globalSearch ? undefined : filters?.actorId,
+      dirPath: globalSearch ? undefined : filters?.dirPath,
       sort,
       limit: PAGE_SIZE,
       offset,
     })
     setRows((prev) => (offset === 0 ? page.rows : [...prev, ...page.rows]))
     setTotal(page.total)
-  }, [search, filters, sort])
+  }, [search, dirSearch, filters, sort])
 
   useEffect(() => {
     if (!hasApi) {
@@ -129,9 +167,10 @@ export default function App() {
     return off
   }, [hasApi, reloadVideos])
 
-  // 切换筛选/目录时清空框选，避免残留选择误删当前不可见的视频
+  // 切换筛选/目录时清空框选与目录内搜索，避免残留影响新列表
   useEffect(() => {
     setSelectedIds(new Set())
+    setDirSearch('')
   }, [filters])
 
   // 订阅后台压缩进度
@@ -173,7 +212,7 @@ export default function App() {
   }, [hasApi, reloadVideos])
 
   /** 发起压缩：支持单个（右键）与批量（框选）。后台执行（1~4 路并行），不阻塞界面。 */
-  async function startCompress(videos: { id: number; path: string; filename: string }[]) {
+  async function startCompress(videos: { id: number; path: string; filename: string; rotation?: number; maxHeight?: number }[]) {
     if (videos.length === 0) return
     const r = await window.api.startCompress(videos)
     if (r.started) {
@@ -256,12 +295,12 @@ export default function App() {
     await moveManyToDir([...selectedIds], dir)
   }
 
-  // 批量删除框选的视频（后端一次确认，直接删硬盘文件，不可恢复）
-  async function deleteSelected() {
-    if (selectedIds.size === 0 || batchDeleting) return
+  // 批量删除指定视频（后端一次确认，直接删硬盘文件，不可恢复）
+  async function runDelete(ids: number[]) {
+    if (ids.length === 0 || batchDeleting) return
     setBatchDeleting(true)
     try {
-      const r = await window.api.deleteVideos([...selectedIds])
+      const r = await window.api.deleteVideos(ids)
       if (r.cancelled) return
       if (!r.ok) {
         flash(r.error ?? '删除失败')
@@ -276,6 +315,10 @@ export default function App() {
     } finally {
       setBatchDeleting(false)
     }
+  }
+  // 删除框选的全部视频（底栏按钮入口）
+  function deleteSelected() {
+    return runDelete([...selectedIds])
   }
 
   // 移动整个文件夹：选目标父目录 → 后端磁盘移动 + 数据库同步 → 全量刷新
@@ -303,7 +346,7 @@ export default function App() {
       flash(`已移动文件夹（${r.moved ?? 0} 条视频记录同步更新）`)
     }
     // 当前浏览目录若在旧路径下，清除筛选避免空白列表
-    if (filters.dirPath && filters.dirPath.startsWith(src)) setFilters((f) => ({ ...f, dirPath: undefined }))
+    if (filters?.dirPath && filters.dirPath.startsWith(src)) setFilters((f) => ({ ...(f ?? {}), dirPath: undefined }))
     reloadMeta()
     reloadVideos(0)
     setDirSignal((s) => s + 1) // 刷新目录栏
@@ -367,7 +410,14 @@ export default function App() {
   const cards = useMemo(() => groupByWork(rows), [rows])
 
   // 搜索时的范围提示：主目录 + 叠加的演员/标签筛选
-  const activeFolder = folders.find((f) => f.id === filters.folderId)
+  const activeFolder = folders.find((f) => f.id === filters?.folderId)
+
+  // 右键菜单的目标：右键的视频已在多选中（且选中数 > 1）时作用于整个选中集，
+  // 否则仅针对该单个视频。multiCount 用于菜单文案（如「压缩所选 5 个…」）。
+  const menuVideo = cardMenu?.video ?? null
+  const menuIsBatch = !!menuVideo && selectedIds.size > 1 && selectedIds.has(menuVideo.id)
+  const menuVideos = menuIsBatch ? rows.filter((v) => selectedIds.has(v.id)) : menuVideo ? [menuVideo] : []
+  const menuCount = menuVideos.length
 
   return (
     <div className='flex h-screen flex-col text-slate-100'>
@@ -378,7 +428,10 @@ export default function App() {
           className='w-72 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm focus:border-cyan-500 focus:outline-none'
           placeholder='搜索标题 / 番号 / 文件名 / 演员'
           value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          onChange={(e) => {
+            setSearch(e.target.value)
+            if (e.target.value) setDirSearch('') // 全局搜索时让位于全局（目录内搜索仅用于目录浏览）
+          }}
           onKeyDown={(e) => e.key === 'Enter' && reloadVideos(0)}
         />
         <select
@@ -435,7 +488,7 @@ export default function App() {
                 </button>
               )}
             </span>
-            {(filters.actorId || filters.tagIds?.length) && (
+            {(filters?.actorId || filters?.tagIds?.length) && (
               <span className='text-slate-600'>演员/标签筛选在搜索时暂停，清除搜索后自动恢复</span>
             )}
           </div>
@@ -491,37 +544,74 @@ export default function App() {
               folders={folders}
               onChanged={reloadMeta}
             />
+          ) : filters === null && !search ? (
+            /* 未选择任何目录：不加载/显示任何视频预览 */
+            <div className='flex h-full flex-col items-center justify-center gap-2 text-slate-600'>
+              <div className='text-sm'>尚未选择目录</div>
+              <div className='text-xs'>在左侧点击主目录或子目录后开始浏览视频</div>
+            </div>
           ) : (
             <>
               {/* 预览区首行：左侧过滤标签 + 右侧操作条（视图切换/扫描此目录）。固定高度并 sticky 置顶，滚动时始终吸在顶部 */}
               <div className='sticky top-0 z-20 flex h-[42px] items-center justify-between gap-2 bg-slate-950 px-4'>
                 <div className='flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-hidden'>
-                  {!search && filters.dirPath && (
+                  {!search && filters?.dirPath && (
                     <span className='inline-flex items-center gap-2 rounded-full bg-cyan-900/60 px-3 py-1 text-xs text-cyan-300'>
                       目录：{filters.dirPath.split(/[\\/]/).filter(Boolean).pop()}
                       <button
                         className='text-cyan-200 hover:text-white'
-                        onClick={() => setFilters((f) => ({ ...f, dirPath: undefined }))}
+                        onClick={() => setFilters((f) => ({ ...(f ?? {}), dirPath: undefined }))}
                       >
                         ✕
                       </button>
                     </span>
                   )}
-                  {!search && filters.actorId && (
+                  {/* 目录内搜索：显示在目录文本后方，结果仅限当前浏览的子目录（可叠加演员/标签筛选） */}
+                  {!search && filters?.dirPath && (
+                    <div className='relative shrink-0'>
+                      <input
+                        className='w-52 rounded-lg border border-slate-700 bg-slate-900 py-1 pl-2.5 pr-7 text-xs text-slate-100 placeholder-slate-600 focus:border-cyan-500 focus:outline-none'
+                        placeholder='在目录内搜索…'
+                        title={`仅搜索当前目录：${filters.dirPath}`}
+                        value={dirSearch}
+                        onChange={(e) => setDirSearch(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') reloadVideos(0)
+                          else if (e.key === 'Escape' && dirSearch) {
+                            setDirSearch('')
+                            reloadVideos(0)
+                          }
+                        }}
+                      />
+                      {dirSearch && (
+                        <button
+                          className='absolute right-1.5 top-1/2 -translate-y-1/2 text-xs text-slate-500 hover:text-slate-200'
+                          title='清除目录内搜索'
+                          onClick={() => {
+                            setDirSearch('')
+                            reloadVideos(0)
+                          }}
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  {!search && filters?.actorId && (
                     <span className='inline-flex items-center gap-2 rounded-full bg-cyan-900/60 px-3 py-1 text-xs text-cyan-300'>
                       演员：{actors.find((a) => a.id === filters.actorId)?.name ?? filters.actorId}
-                      <button className='text-cyan-200 hover:text-white' onClick={() => setFilters((f) => ({ ...f, actorId: undefined }))}>
+                      <button className='text-cyan-200 hover:text-white' onClick={() => setFilters((f) => ({ ...(f ?? {}), actorId: undefined }))}>
                         ✕
                       </button>
                     </span>
                   )}
                   {!search &&
-                    filters.tagIds?.map((tagId) => (
+                    filters?.tagIds?.map((tagId) => (
                       <span key={tagId} className='inline-flex items-center gap-2 rounded-full bg-cyan-900/60 px-3 py-1 text-xs text-cyan-300'>
                         标签：{tags.find((t) => t.id === tagId)?.name ?? tagId}
                         <button
                           className='text-cyan-200 hover:text-white'
-                          onClick={() => setFilters((f) => ({ ...f, tagIds: f.tagIds?.filter((id) => id !== tagId) }))}
+                          onClick={() => setFilters((f) => ({ ...(f ?? {}), tagIds: f?.tagIds?.filter((id) => id !== tagId) }))}
                         >
                           ✕
                         </button>
@@ -561,14 +651,14 @@ export default function App() {
                     </svg>
                   </button>
                 </div>
-                {filters.folderId != null && (
+                {filters?.folderId != null && (
                   <button
                     className='flex h-[30px] items-center rounded-lg border border-cyan-700 px-2.5 text-xs text-cyan-300 hover:bg-cyan-950 disabled:opacity-50'
                     disabled={scanning}
-                    onClick={() => scan(filters.dirPath ? { folderId: filters.folderId, dirPath: filters.dirPath } : { folderId: filters.folderId })}
-                    title={filters.dirPath ? '只扫描当前浏览的子目录' : '只扫描当前选中的文件夹'}
+                    onClick={() => scan(filters!.dirPath ? { folderId: filters!.folderId, dirPath: filters!.dirPath } : { folderId: filters!.folderId })}
+                    title={filters?.dirPath ? '只扫描当前浏览的子目录' : '只扫描当前选中的文件夹'}
                   >
-                    {scanning ? '扫描中…' : filters.dirPath ? '扫描此目录' : '扫描此文件夹'}
+                    {scanning ? '扫描中…' : filters?.dirPath ? '扫描此目录' : '扫描此文件夹'}
                   </button>
                 )}
                 </div>
@@ -760,6 +850,13 @@ export default function App() {
         </div>
       )}
 
+      {/* 移动文件夹进度浮窗（右下角；压缩面板同时显示时移到右上角避免重叠） */}
+      {dirMove && (
+        <div className={`fixed z-50 ${compress ? 'right-4 top-16' : 'bottom-4 right-4'}`}>
+          <MoveDirToast progress={dirMove} onClose={() => setDirMove(null)} />
+        </div>
+      )}
+
       {openVideoId !== null && (
         <VideoDetail
           videoId={openVideoId}
@@ -767,115 +864,181 @@ export default function App() {
         />
       )}
 
-      {/* 卡片右键菜单 */}
+      {/* 卡片右键菜单（portal 到 body，避免被祖先 overflow/blur 裁剪） */}
       {cardMenu && (
-        <>
-          <div className='fixed inset-0 z-50' onClick={() => setCardMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCardMenu(null) }} />
-          <div
-            className='anim-dialog fixed z-[51] w-48 overflow-hidden rounded-xl border border-slate-700 bg-slate-900/95 py-1 shadow-2xl shadow-black/60 backdrop-blur'
-            style={{ left: Math.min(cardMenu.x, window.innerWidth - 200), top: Math.min(cardMenu.y, window.innerHeight - 150) }}
-          >
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-              onClick={async () => {
-                const v = cardMenu.video
-                setCardMenu(null)
-                const d = await window.api.getVideo(v.id)
-                if (d) setEditVideo(d)
-              }}
-            >
-              编辑视频信息
-            </button>
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-              onClick={() => {
-                const v = cardMenu.video
-                setCardMenu(null)
-                setCaptureVideo({ videoPath: v.path, videoId: v.id })
-              }}
-            >
-              手动截取缩略图
-            </button>
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-              onClick={() => {
-                const v = cardMenu.video
-                setCardMenu(null)
-                startCompress([v])
-              }}
-            >
-              压缩视频…
-            </button>
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-              onClick={() => {
-                const v = cardMenu.video
-                setCardMenu(null)
-                setRenameVideo({ videoId: v.id, filename: v.filename })
-              }}
-            >
-              重命名文件…
-            </button>
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-              onClick={() => {
-                setCardMenu(null)
-                window.api.showInFolder(cardMenu.video.path)
-              }}
-            >
-              打开所在文件夹
-            </button>
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
-              onClick={async () => {
-                const v = cardMenu.video
-                setCardMenu(null)
-                // 右键的视频在选中集内且为多选 → 集体移动；否则只移动该视频
-                if (selectedIds.size > 1 && selectedIds.has(v.id)) {
-                  await moveSelectedToDir()
-                  return
-                }
-                const dir = await window.api.pickDirectory()
-                if (!dir) return
-                const r = await window.api.moveVideo({ id: v.id, targetDir: dir })
-                if (!r.ok) {
-                  flash(r.error ?? '移动失败')
-                  return
-                }
-                if (r.moved === false) {
-                  flash('该视频已在目标文件夹中')
-                  return
-                }
-                flash(`已移动「${v.filename}」`)
-                reloadMeta()
-                reloadVideos(0)
-              }}
-            >
-              {selectedIds.size > 1 && selectedIds.has(cardMenu.video.id)
-                ? `移动 ${selectedIds.size} 个视频到…`
-                : '移动视频到…'}
-            </button>
-            <div className='my-1 border-t border-slate-800' />
-            <button
-              className='block w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-red-950/60'
-              onClick={async () => {
-                const v = cardMenu.video
-                setCardMenu(null)
-                const r = await window.api.deleteVideo(v.id)
-                if (r.cancelled) return
-                if (!r.ok) {
-                  flash(r.error ?? '删除失败')
-                  return
-                }
-                flash(r.partial ? `已删除（部分文件未删除干净：${r.failed?.join('；') ?? ''}）` : `已彻底删除「${v.filename}」`)
-                reloadMeta()
-                reloadVideos(0)
-              }}
-            >
-              删除影片…
-            </button>
-          </div>
-        </>
+        <ContextMenu x={cardMenu.x} y={cardMenu.y} onClose={() => setCardMenu(null)} className='w-60'>
+          {menuIsBatch ? (
+            /* 多选后右键菜单直接是批量任务：等效于屏幕底部操作栏，无需移动鼠标到底部 */
+            <>
+              <div className='px-4 pb-1 pt-2 text-[11px] text-slate-500'>已选择 {menuCount} 个视频，操作将作用于全部</div>
+              <div className='mx-3 mb-1 border-t border-slate-800' />
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  setCardMenu(null)
+                  setShowBatchEdit(true)
+                }}
+              >
+                批量编辑视频信息…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const vs = menuVideos
+                  setCardMenu(null)
+                  startCompress(vs)
+                }}
+              >
+                压缩所选 {menuCount} 个视频…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const vs = menuVideos
+                  setCardMenu(null)
+                  setRotateCompressVideos(vs)
+                }}
+              >
+                旋转压缩所选 {menuCount} 个视频…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  setCardMenu(null)
+                  void moveSelectedToDir()
+                }}
+              >
+                移动所选 {menuCount} 个视频到…
+              </button>
+              <div className='my-1 border-t border-slate-800' />
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-red-950/60'
+                onClick={() => {
+                  const ids = menuVideos.map((v) => v.id)
+                  setCardMenu(null)
+                  void runDelete(ids)
+                }}
+              >
+                删除所选 {menuCount} 个影片…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-400 hover:bg-slate-800'
+                onClick={() => {
+                  setCardMenu(null)
+                  setSelectedIds(new Set())
+                }}
+              >
+                取消选择
+              </button>
+            </>
+          ) : (
+            /* 单个视频（未多选 / 右键目标不在选中集内）的菜单 */
+            <>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={async () => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  const d = await window.api.getVideo(v.id)
+                  if (d) setEditVideo(d)
+                }}
+              >
+                编辑视频信息
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  setCaptureVideo({ videoPath: v.path, videoId: v.id })
+                }}
+              >
+                手动截取缩略图
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  startCompress([v])
+                }}
+              >
+                压缩视频…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  setRotateCompressVideos([v])
+                }}
+              >
+                旋转压缩视频…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  setRenameVideo({ videoId: v.id, filename: v.filename })
+                }}
+              >
+                重命名文件…
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={() => {
+                  setCardMenu(null)
+                  window.api.showInFolder(cardMenu.video.path)
+                }}
+              >
+                打开所在文件夹
+              </button>
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-slate-200 hover:bg-slate-800'
+                onClick={async () => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  const dir = await window.api.pickDirectory()
+                  if (!dir) return
+                  const r = await window.api.moveVideo({ id: v.id, targetDir: dir })
+                  if (!r.ok) {
+                    flash(r.error ?? '移动失败')
+                    return
+                  }
+                  if (r.moved === false) {
+                    flash('该视频已在目标文件夹中')
+                    return
+                  }
+                  flash(`已移动「${v.filename}」`)
+                  reloadMeta()
+                  reloadVideos(0)
+                }}
+              >
+                移动视频到…
+              </button>
+              <div className='my-1 border-t border-slate-800' />
+              <button
+                className='block w-full px-4 py-2 text-left text-sm text-red-400 hover:bg-red-950/60'
+                onClick={async () => {
+                  const v = cardMenu.video
+                  setCardMenu(null)
+                  const r = await window.api.deleteVideo(v.id)
+                  if (r.cancelled) return
+                  if (!r.ok) {
+                    flash(r.error ?? '删除失败')
+                    return
+                  }
+                  flash(r.partial ? `已删除（部分文件未删除干净：${r.failed?.join('；') ?? ''}）` : `已彻底删除「${v.filename}」`)
+                  reloadMeta()
+                  reloadVideos(0)
+                }}
+              >
+                删除影片…
+              </button>
+            </>
+          )}
+        </ContextMenu>
       )}
 
       {editVideo && (
@@ -900,6 +1063,18 @@ export default function App() {
             setCaptureVideo(null)
             reloadMeta()
             reloadVideos(0)
+          }}
+        />
+      )}
+
+      {rotateCompressVideos && (
+        <RotateCompressDialog
+          videos={rotateCompressVideos}
+          onClose={() => setRotateCompressVideos(null)}
+          onStart={(rotation, maxHeight) => {
+            const list = rotateCompressVideos
+            setRotateCompressVideos(null)
+            startCompress(list.map((v) => ({ id: v.id, path: v.path, filename: v.filename, rotation, maxHeight })))
           }}
         />
       )}

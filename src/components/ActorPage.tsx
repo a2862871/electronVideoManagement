@@ -29,6 +29,11 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
   const [editingAlias, setEditingAlias] = useState<{ id: number; text: string } | null>(null)
   // 记录已提示过的合并对（"当前演员id|已存在演员id"），避免同一组合反复弹窗
   const promptedRef = useRef<Set<string>>(new Set())
+  // 批量删除弹窗：输入名字 → 检查匹配 → 确认删除
+  const [batchDelOpen, setBatchDelOpen] = useState(false)
+  const [batchDelInput, setBatchDelInput] = useState('')
+  const [batchDelResult, setBatchDelResult] = useState<{ matched: ActorDto[]; unmatched: string[] } | null>(null)
+  const [batchDeleting, setBatchDeleting] = useState(false)
   const { confirm, alert } = useDialog()
 
   const valueOf = (a: ActorDto) => drafts[a.id] ?? a.alias ?? ''
@@ -53,17 +58,20 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // 名字比较键：去掉全部空白（含名字中间的空格）再转小写，使「田中 太郎」与「田中太郎」视为同名
+  const nameKey = (s: string) => s.replace(/\s+/g, '').toLowerCase()
+
   // 在「曾用名」输入框填写时：停顿 600ms 后，若输入的名字恰好是库中另一位
-  // 已存在演员（主名或曾用名），弹窗询问是否将其合并进当前行演员。
+  // 已存在演员（主名或曾用名，忽略空格与大小写），弹窗询问是否将其合并进当前行演员。
   async function promptMergeIfAliasHit(me: ActorDto, text: string) {
     const pieces = text.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
     if (pieces.length === 0) return
     for (const piece of pieces) {
-      const key = piece.toLowerCase()
+      const key = nameKey(piece)
       const match = actors.find((a) => {
         if (a.id === me.id) return false
         const names = [a.name, ...(a.alias ?? '').split(/[,，]/).map((s) => s.trim()).filter(Boolean)]
-        return names.some((n) => n.toLowerCase() === key)
+        return names.some((n) => nameKey(n) === key)
       })
       if (!match) continue
       const lock = `${me.id}|${match.id}`
@@ -162,6 +170,71 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
     }
   }
 
+  async function deleteActor(a: ActorDto) {
+    const ok = await confirm({
+      title: '删除演员',
+      message: `将删除演员「${a.name}」，并从 ${a.count} 部作品中移除该演员的标记。`,
+      detail: '作品文件本身不会被删除或修改。此操作不可撤销，确定继续吗？',
+      confirmText: '删除',
+      danger: true,
+    })
+    if (!ok) return
+    const removed = await window.api.deleteActor(a.id)
+    refresh()
+    await alert({ title: '删除完成', message: `已删除「${a.name}」，解除 ${removed} 处作品关联` })
+  }
+
+  // 批量删除：按名字（主名或曾用名，忽略空格与大小写）匹配输入的每一位
+  function checkBatchDelete() {
+    const pieces = batchDelInput.split(/[,，]/).map((s) => s.trim()).filter(Boolean)
+    const matched: ActorDto[] = []
+    const unmatched: string[] = []
+    const seen = new Set<number>()
+    for (const piece of pieces) {
+      const key = nameKey(piece)
+      const hit = actors.find((a) => {
+        if (seen.has(a.id)) return false
+        const names = [a.name, ...(a.alias ?? '').split(/[,，]/)]
+        return names.some((n) => nameKey(n) === key)
+      })
+      if (hit) {
+        seen.add(hit.id)
+        matched.push(hit)
+      } else {
+        unmatched.push(piece)
+      }
+    }
+    setBatchDelResult({ matched, unmatched })
+  }
+
+  async function doBatchDelete() {
+    const res = batchDelResult
+    if (!res || res.matched.length === 0 || batchDeleting) return
+    setBatchDeleting(true)
+    let removed = 0
+    const failed: string[] = []
+    for (const a of res.matched) {
+      try {
+        removed += await window.api.deleteActor(a.id)
+      } catch {
+        failed.push(a.name)
+      }
+    }
+    setBatchDeleting(false)
+    setBatchDelOpen(false)
+    setBatchDelInput('')
+    setBatchDelResult(null)
+    refresh()
+    const okCount = res.matched.length - failed.length
+    await alert({
+      title: failed.length ? '批量删除（部分失败）' : '批量删除完成',
+      message: failed.length
+        ? `已删除 ${okCount} 位演员（解除 ${removed} 处作品关联）；删除失败：${failed.join('、')}`
+        : `已删除 ${okCount} 位演员，共解除 ${removed} 处作品关联`,
+      danger: failed.length > 0,
+    })
+  }
+
   async function cleanupEmpty() {
     const empty = actors.filter((a) => a.count === 0)
     if (empty.length === 0) {
@@ -211,6 +284,13 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
           >
             清理空演员
           </button>
+          <button
+            className='ml-1 rounded-lg border border-red-900/70 px-3 py-1.5 text-sm text-red-300 hover:bg-red-950/40'
+            onClick={() => { setBatchDelInput(''); setBatchDelResult(null); setBatchDelOpen(true) }}
+            title='按名字批量删除演员'
+          >
+            批量删除
+          </button>
         </div>
       </div>
 
@@ -252,6 +332,17 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
                     value={valueOf(a)}
                     placeholder='多个名字用逗号隔开，如：三上, 悠亚'
                     onChange={(e) => onAliasChange(a, e.target.value)}
+                    onPaste={(e) => {
+                      // 粘贴曾用名时自动去掉所有空白（含名字中间的空格）
+                      const text = e.clipboardData.getData('text')
+                      if (!/\s/.test(text)) return
+                      e.preventDefault()
+                      const el = e.currentTarget
+                      const start = el.selectionStart ?? el.value.length
+                      const end = el.selectionEnd ?? el.value.length
+                      const next = el.value.slice(0, start) + text.replace(/\s+/g, '') + el.value.slice(end)
+                      onAliasChange(a, next)
+                    }}
                     onKeyDown={(e) => e.key === 'Enter' && saveAlias(a)}
                   />
                 </td>
@@ -266,6 +357,13 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
                     title='将该演员合并到另一位演员（保留后者）'
                   >
                     合并…
+                  </button>
+                  <button
+                    className='mr-3 text-red-400 hover:text-red-300'
+                    onClick={() => deleteActor(a)}
+                    title='删除该演员（不影响作品文件）'
+                  >
+                    删除
                   </button>
                   <button
                     className='text-slate-400 hover:text-slate-200 disabled:opacity-50'
@@ -297,6 +395,69 @@ export default function ActorPage({ actors, onChanged, onFilter }: Props) {
       <div className='text-xs text-slate-500'>
         排序规则：演员与其曾用名合并排序，列表中位置由所有名字中字母序最早者决定；搜索时输入曾用名也能匹配。
       </div>
+
+      {batchDelOpen && (
+        <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6' onClick={() => setBatchDelOpen(false)}>
+          <div
+            className='w-full max-w-md space-y-4 rounded-2xl border border-slate-700 bg-slate-950 p-5'
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className='text-lg font-semibold text-slate-100'>批量删除演员</div>
+            <div>
+              <label className='mb-1 block text-xs text-slate-400'>演员名（多个用逗号隔开，可用曾用名匹配，忽略空格）</label>
+              <input
+                className={inputCls}
+                value={batchDelInput}
+                placeholder='如：演员A, 演员B'
+                onChange={(e) => { setBatchDelInput(e.target.value); setBatchDelResult(null) }}
+                onKeyDown={(e) => e.key === 'Enter' && checkBatchDelete()}
+              />
+            </div>
+            {batchDelResult && (
+              <div className='space-y-2 text-sm'>
+                {batchDelResult.matched.length > 0 && (
+                  <div className='rounded-lg border border-slate-800 p-3'>
+                    <div className='mb-1 text-xs text-slate-400'>将删除以下 {batchDelResult.matched.length} 位演员：</div>
+                    {batchDelResult.matched.map((a) => (
+                      <div key={a.id} className='text-red-300'>
+                        {a.name}
+                        <span className='ml-2 text-xs text-slate-500'>{a.count} 部作品</span>
+                        {a.alias && <span className='ml-2 text-xs text-slate-500'>曾用名：{a.alias}</span>}
+                      </div>
+                    ))}
+                    <div className='mt-1 text-xs text-slate-500'>仅删除演员数据及作品关联，作品文件不受影响。不可撤销。</div>
+                  </div>
+                )}
+                {batchDelResult.matched.length === 0 && (
+                  <div className='text-slate-400'>没有匹配到任何演员。</div>
+                )}
+                {batchDelResult.unmatched.length > 0 && (
+                  <div className='text-xs text-amber-400/90'>未找到：{batchDelResult.unmatched.join('、')}</div>
+                )}
+              </div>
+            )}
+            <div className='flex justify-end gap-2'>
+              <button className='rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-900' onClick={() => setBatchDelOpen(false)}>
+                取消
+              </button>
+              <button
+                className='rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-200 hover:bg-slate-900 disabled:opacity-50'
+                disabled={!batchDelInput.trim() || batchDeleting}
+                onClick={checkBatchDelete}
+              >
+                检查
+              </button>
+              <button
+                className='rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50'
+                disabled={!batchDelResult || batchDelResult.matched.length === 0 || batchDeleting}
+                onClick={doBatchDelete}
+              >
+                {batchDeleting ? '删除中…' : '确认删除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {mergeSource && (
         <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6' onClick={() => setMergeSource(null)}>
