@@ -1000,11 +1000,16 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
 
   // 压缩任务队列：按配置并发数（1~4 路）并行执行，worker pool 模式
   // rotation：可选的烧录旋转角度（0/90/180/270），「旋转压缩」入口传入
+  // 队列跨批次共享：压缩进行中再次 compress:start 会把新任务追加进同一路队列，
+  // 并按新批次的并发数补足 worker（此前是整队替换 + running 直接 return，
+  // 导致逐个选视频压缩时后续任务进不了并发队列）。
   let queue: { id: number; path: string; filename: string; rotation?: number }[] = []
-  let running = false
+  let activeWorkers = 0
   let cancelled = false
   // 活跃任务的取消句柄（videoId → cancel），支持多路并发下按任务取消
   const activeCancels = new Map<number, () => void>()
+  // 会话级统计：跨多次 compress:start 累计；队列彻底清空后汇总广播一次并重置
+  const stats = { total: 0, done: 0, ok: 0, skip: 0, savedBytes: 0, failed: [] as { filename: string; error: string }[] }
 
   function pushCompressProgress(p: Record<string, unknown>): void {
     for (const w of BrowserWindow.getAllWindows()) w.webContents.send('compress:progress', p)
@@ -1100,52 +1105,51 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     }
   }
 
-  /** 后台处理压缩队列（按配置 1~4 路并行），完成后广播汇总。 */
-  async function drainCompressQueue(ffmpeg: string, ffprobe: string | null, cfg: CompressConfig): Promise<void> {
-    if (running) return
-    running = true
-    const total = queue.length
-    let done = 0
-    let okCount = 0
-    let skipCount = 0
-    const failed: { filename: string; error: string }[] = []
-    let savedBytes = 0
-
-    // worker pool：N 个 worker 并发从队列取任务（N = 配置的并发数，钳制 1~4）
-    const workers = Math.max(1, Math.min(4, Math.round(cfg.concurrency ?? 1)))
-    async function worker(): Promise<void> {
+  /** 单个压缩 worker：循环从共享队列取任务，直到队列清空或取消。
+   *  由 compress:start 按并发数调起；运行中追加的新任务由在跑 worker 继续消化。 */
+  async function runCompressWorker(ffmpeg: string, ffprobe: string | null, cfg: CompressConfig): Promise<void> {
+    activeWorkers++
+    try {
       while (queue.length > 0 && !cancelled) {
         const item = queue.shift()!
         // remaining：尚未开始处理的文件名（供前端显示剩余队列）
         const remaining = queue.map((q) => q.filename)
         pushCompressProgress({
           videoId: item.id, filename: item.filename, percent: 0, speed: '', outSize: 0,
-          stage: '准备中', current: done + 1, total, remaining,
+          stage: '准备中', current: stats.done + 1, total: stats.total, remaining,
         })
         const r = await compressOne(ffmpeg, ffprobe, item, cfg)
-        done++
+        stats.done++
         if (r.skipped) {
-          skipCount++
+          stats.skip++
         } else if (r.ok) {
-          okCount++
-          savedBytes += Math.max(0, (r.oldSize ?? 0) - (r.newSize ?? 0))
+          stats.ok++
+          stats.savedBytes += Math.max(0, (r.oldSize ?? 0) - (r.newSize ?? 0))
         } else {
-          failed.push({ filename: item.filename, error: r.error ?? '未知错误' })
+          stats.failed.push({ filename: item.filename, error: r.error ?? '未知错误' })
         }
         pushCompressProgress({
           videoId: item.id, filename: item.filename, percent: 100, speed: '', outSize: r.newSize ?? 0,
-          stage: r.skipped ? '已跳过（未变小）' : r.ok ? '完成' : '失败', current: done, total,
+          stage: r.skipped ? '已跳过（未变小）' : r.ok ? '完成' : '失败', current: stats.done, total: stats.total,
           remaining: queue.map((q) => q.filename),
         })
       }
+    } finally {
+      activeWorkers--
+      // 队列清空且无 worker 在跑：整场结束（含跨批次追加的任务），汇总广播并重置。
+      // 此判断与后续重置同步执行，中间无 await，不会与新的 compress:start 竞态。
+      if (activeWorkers === 0 && queue.length === 0 && stats.total > 0) finalizeCompressSession()
     }
-    await Promise.all(Array.from({ length: workers }, () => worker()))
+  }
 
-    queue = []
-    running = false
+  /** 汇总本轮（可能含多批次）压缩结果：广播 finished、弹系统通知、重置统计。 */
+  function finalizeCompressSession(): void {
     const wasCancelled = cancelled
     cancelled = false
+    queue = []
     activeCancels.clear()
+    const { total, done, ok: okCount, skip: skipCount, savedBytes, failed } = stats
+    stats.total = 0; stats.done = 0; stats.ok = 0; stats.skip = 0; stats.savedBytes = 0; stats.failed = []
     pushCompressProgress({
       finished: true,
       cancelled: wasCancelled,
@@ -1237,15 +1241,19 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       repo.setSetting(db, 'compressConfig', JSON.stringify(cfg))
     }
 
-    queue = list
+    // 追加进共享队列（压缩进行中再次启动也如此），统计跨批次累计
+    queue.push(...list)
     cancelled = false
+    stats.total += list.length
     const ffprobe = await findFfprobe(ffmpeg)
-    void drainCompressQueue(ffmpeg, ffprobe, cfg) // 后台执行，不阻塞界面
+    // worker pool：补足到当前配置的并发数（1~4）；已在跑的 worker 会继续消化新任务
+    const workers = Math.max(1, Math.min(4, Math.round(cfg.concurrency ?? 1)))
+    for (let i = activeWorkers; i < workers; i++) void runCompressWorker(ffmpeg, ffprobe, cfg)
     return { started: true, count: list.length }
   })
 
   ipcMain.handle('compress:cancel', () => {
-    if (!running) return
+    if (activeWorkers === 0 && queue.length === 0) return
     cancelled = true
     // 取消所有进行中的 ffmpeg 进程（多路并发）
     for (const cancel of activeCancels.values()) {

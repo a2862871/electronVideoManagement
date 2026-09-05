@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { useDialog } from './DialogProvider'
 import ContextMenu from './ContextMenu'
-import type { TagDto } from '../type/library'
+import type { ActorDto, TagDto } from '../type/library'
 
 interface Props {
   tags: TagDto[]
+  /** 用于「清理同名标签」：与演员名/曾用名重名的标签视为刮削器误入库的演员名 */
+  actors: ActorDto[]
   onChanged(): void
   /** 按多个标签筛选（同时包含这些标签的视频） */
   onFilter(tagIds: number[]): void
@@ -12,7 +14,7 @@ interface Props {
 
 const inputCls = 'rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-100 focus:border-cyan-500 focus:outline-none'
 
-export default function TagPage({ tags, onChanged, onFilter }: Props) {
+export default function TagPage({ tags, actors, onChanged, onFilter }: Props) {
   const [query, setQuery] = useState('')
   const [editingId, setEditingId] = useState<number | null>(null)
   const [draft, setDraft] = useState('')
@@ -139,6 +141,55 @@ export default function TagPage({ tags, onChanged, onFilter }: Props) {
     onChanged()
   }
 
+  // 名字比较键：去掉全部空白转小写（与演员页一致，「田中 太郎」和「田中太郎」视为同名）
+  const nameKey = (s: string) => s.replace(/\s+/g, '').toLowerCase()
+
+  // 清理与演员重名的标签：刮削器常把演员名写进 NFO 的 tag/genre，扫描时被当普通标签
+  // 入库到标签栏。这里检查标签名是否与某演员的主名或曾用名重名（含空格变体），是则删除。
+  async function cleanActorTags() {
+    const byKey = new Map<string, { actor: string; viaAlias: boolean }>()
+    for (const a of actors) {
+      const entries: [string, boolean][] = [[a.name, false]]
+      for (const p of (a.alias ?? '').split(/[,，]/)) {
+        if (p.trim()) entries.push([p, true])
+      }
+      for (const [n, viaAlias] of entries) {
+        const k = nameKey(n)
+        if (k && !byKey.has(k)) byKey.set(k, { actor: a.name, viaAlias })
+      }
+    }
+    const hits = tags
+      .map((t) => {
+        const m = byKey.get(nameKey(t.name))
+        return m ? { tag: t, matched: m } : null
+      })
+      .filter((h): h is { tag: TagDto; matched: { actor: string; viaAlias: boolean } } => h !== null)
+
+    if (hits.length === 0) {
+      await alert({ title: '提示', message: '没有与演员名或曾用名重名的标签' })
+      return
+    }
+    const affected = hits.reduce((s, h) => s + h.tag.count, 0)
+    const list = hits
+      .slice(0, 10)
+      .map((h) => `「${h.tag.name}」→ ${h.matched.viaAlias ? `${h.matched.actor} 的曾用名` : h.matched.actor}`)
+      .join('、')
+    const ok = await confirm({
+      title: '清理同名标签',
+      message: `发现 ${hits.length} 个与演员（含曾用名）重名的标签，将全部删除，涉及 ${affected} 处视频关联。`,
+      detail: `${list}${hits.length > 10 ? '…' : ''}\n视频不会被删除，仅移除这些标签。此操作不可撤销。`,
+      confirmText: '删除',
+      danger: true,
+    })
+    if (!ok) return
+    for (const h of hits) {
+      await window.api.deleteTag(h.tag.id)
+    }
+    setSelected([])
+    onChanged()
+    await alert({ title: '清理完成', message: `已删除 ${hits.length} 个与演员重名的标签` })
+  }
+
   return (
     <div className='mx-auto max-w-3xl space-y-4 p-6'>
       <div className='flex items-center justify-between gap-4'>
@@ -150,6 +201,13 @@ export default function TagPage({ tags, onChanged, onFilter }: Props) {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
+          <button
+            className='rounded-lg border border-slate-700 px-4 py-1.5 text-sm text-slate-300 hover:bg-slate-900'
+            onClick={cleanActorTags}
+            title='删除与演员名或曾用名重名的标签（刮削器误入库的演员名）'
+          >
+            清理同名标签
+          </button>
           <button
             className='btn-primary rounded-lg px-4 py-1.5 text-sm font-medium text-white disabled:opacity-40'
             disabled={selected.length === 0}

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, screen, shell, ipcMain, protocol, Menu, dialog } from 'electron'
+import { app, BrowserWindow, screen, shell, ipcMain, protocol, Menu, Tray, nativeImage, dialog } from 'electron'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -66,8 +66,62 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 let win: BrowserWindow | null = null
+// 关闭行为：「缩小到托盘」时点关闭按钮只隐藏窗口，应用驻留托盘后台运行
+let tray: Tray | null = null
+let quitting = false
+// 主库连接（whenReady 中创建），供关闭行为设置读取
+let appDb: ReturnType<typeof openLibraryDb> | null = null
 const preload = path.join(__dirname, '../preload/index.mjs')
 const indexHtml = path.join(RENDERER_DIST, 'index.html')
+
+/** 关闭行为设置：'tray' = 缩小到托盘；其余（含未设置）= 完全退出。 */
+function getCloseAction(): 'tray' | 'exit' {
+  try {
+    return appDb && repo.getSetting(appDb, 'closeAction') === 'tray' ? 'tray' : 'exit'
+  } catch {
+    return 'exit'
+  }
+}
+
+/** 显示并聚焦主窗口（托盘点击/双击、second-instance 共用）。 */
+function showMainWindow(): void {
+  if (!win) return
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+/** 首次缩小到托盘时创建托盘图标：左键/双击恢复窗口，右键菜单可恢复或退出。 */
+function ensureTray(): void {
+  if (tray) return
+  const icon = nativeImage.createFromPath(path.join(process.env.VITE_PUBLIC, 'favicon.ico'))
+  tray = new Tray(icon.isEmpty() ? icon : icon.resize({ width: 16, height: 16 }))
+  tray.setToolTip('VideoLib（仍在后台运行）')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主窗口', click: showMainWindow },
+    { type: 'separator' },
+    {
+      label: '退出',
+      click: () => {
+        quitting = true
+        app.quit()
+      },
+    },
+  ]))
+  tray.on('click', showMainWindow)
+  tray.on('double-click', showMainWindow)
+  // Windows 气泡提示（一次性）：让用户知道窗口只是收进了托盘，不是关闭
+  if (process.platform === 'win32') {
+    try {
+      tray.displayBalloon({
+        title: 'VideoLib 仍在后台运行',
+        content: '已缩小到系统托盘，点击托盘图标可恢复窗口；后台压缩/扫描不会中断。',
+      })
+    } catch {
+      // 气泡失败不影响功能
+    }
+  }
+}
 
 protocol.registerSchemesAsPrivileged([
   { scheme: MEDIA_SCHEME, privileges: { secure: true, stream: true, supportFetchAPI: true } },
@@ -120,6 +174,16 @@ async function createWindow() {
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https:')) shell.openExternal(url)
     return { action: 'deny' }
+  })
+
+  // 关闭行为：设置为「缩小到托盘」时拦截关闭，仅隐藏窗口（应用与后台任务继续运行）；
+  // 真正退出（托盘菜单退出 / exit 模式关窗）时 quitting 已置位，直接放行。
+  win.on('close', (e) => {
+    if (!quitting && getCloseAction() === 'tray') {
+      e.preventDefault()
+      win?.hide()
+      ensureTray()
+    }
   })
 }
 
@@ -180,6 +244,7 @@ app.whenReady().then(async () => {
   Menu.setApplicationMenu(null)
   const { dataDir, configFile } = await resolveDataDir() // 首次运行会弹目录选择框，需等待用户操作
   const db = openLibraryDb(path.join(dataDir, 'videolib.db'))
+  appDb = db
   repo.setSetting(db, 'dataDir', dataDir) // 供设置页展示当前库位置
   registerMediaProtocol()
   registerThumbProtocol(db)
@@ -203,10 +268,16 @@ app.on('window-all-closed', () => {
 
 app.on('second-instance', () => {
   if (win) {
-    // Focus on the main window if the user tried to open another
+    // Focus on the main window if the user tried to open another（含从托盘恢复隐藏的窗口）
     if (win.isMinimized()) win.restore()
+    win.show()
     win.focus()
   }
+})
+
+// 任何途径的退出（托盘菜单 / exit 模式关窗 / 系统关机）都先置位，让 close 拦截放行
+app.on('before-quit', () => {
+  quitting = true
 })
 
 app.on('activate', () => {

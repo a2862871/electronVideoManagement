@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { DEFAULT_COMPRESS_CONFIG, type CompressConfig, type WatchFolderDto } from '../type/library'
 import { DEFAULT_COVER_H, MAX_COVER_H, MIN_COVER_H, PORTRAIT_SCALE } from './VideoGrid'
+import { RESOLUTION_OPTIONS } from './RotateCompressDialog'
 
 interface Props {
   folders: WatchFolderDto[]
@@ -223,6 +224,8 @@ function AppSection() {
   const [showDuration, setShowDuration] = useState(true)
   const [showSize, setShowSize] = useState(true)
   const [coverH, setCoverH] = useState(DEFAULT_COVER_H)
+  // 关闭行为：tray=点关闭缩小到托盘（后台运行）；exit=完全退出（默认）
+  const [closeAction, setCloseAction] = useState<'tray' | 'exit'>('exit')
   const [loaded, setLoaded] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -238,7 +241,8 @@ function AppSection() {
       window.api.getSetting('showDuration'),
       window.api.getSetting('showSize'),
       window.api.getSetting('coverHeight'),
-    ]).then(([f, p, d, m, a, sd, ss, ch]) => {
+      window.api.getSetting('closeAction'),
+    ]).then(([f, p, d, m, a, sd, ss, ch, ca]) => {
       setFfmpegPath(f ?? '')
       setPlayerPath(p ?? '')
       setDataDir(d ?? '')
@@ -248,6 +252,7 @@ function AppSection() {
       setShowSize(ss !== '0') // 默认开启
       const n = Number(ch)
       setCoverH(Number.isFinite(n) && n > 0 ? n : DEFAULT_COVER_H)
+      setCloseAction(ca === 'tray' ? 'tray' : 'exit')
       setLoaded(true)
     })
   }, [])
@@ -281,6 +286,12 @@ function AppSection() {
   async function changeThumbMode(mode: 'eager' | 'lazy') {
     const r = await window.api.setThumbLoadMode(mode)
     setThumbMode(r)
+  }
+
+  // 关闭行为：立即生效，无需点保存
+  async function changeCloseAction(next: 'tray' | 'exit') {
+    setCloseAction(next)
+    await window.api.setSetting({ key: 'closeAction', value: next })
   }
 
   // 迁移数据库：选目录 → 主进程快照复制 + 写引导配置 → 自动重启
@@ -361,6 +372,27 @@ function AppSection() {
             <div className='mt-1 text-xs text-slate-500'>
               横版封面（16:9）的高度，据此决定列宽（约 {Math.round(coverH * (16 / 9))}px）。
               所有卡片等宽紧密排列，竖版封面按比例自然加高，最高约 {Math.round(coverH * PORTRAIT_SCALE)}px。
+            </div>
+          </div>
+        </div>
+
+        {/* ---------- 窗口行为 ---------- */}
+        <div className='space-y-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3'>
+          <div className='text-sm font-medium text-slate-200'>窗口行为</div>
+          <div>
+            <label className={labelCls}>点击关闭按钮时</label>
+            <div className='flex gap-2'>
+              <button className={modeBtnCls(closeAction === 'tray')} onClick={() => changeCloseAction('tray')}>
+                缩小到托盘
+              </button>
+              <button className={modeBtnCls(closeAction === 'exit')} onClick={() => changeCloseAction('exit')}>
+                完全退出
+              </button>
+            </div>
+            <div className='mt-1 text-xs text-slate-500'>
+              缩小到托盘：窗口收进系统托盘（首次会弹气泡提示），应用在后台继续运行，
+              压缩/扫描等任务不中断，点击托盘图标或右键菜单「显示主窗口」可恢复，托盘菜单也可彻底退出；
+              完全退出：关闭窗口即退出应用。
             </div>
           </div>
         </div>
@@ -583,17 +615,18 @@ function CompressSection() {
         <div className='grid grid-cols-2 gap-3'>
           <div>
             <label className={labelCls}>分辨率上限</label>
-            <select
-              className={inputCls}
-              value={compress.maxHeight}
-              onChange={(e) => updateCompress({ maxHeight: Number(e.target.value) as 0 | 1440 | 1080 | 720 })}
-            >
-              <option value={0}>保持原始</option>
-              <option value={1440}>限制到 2K（2560×1440）</option>
-              <option value={1080}>限制到 1080p</option>
-              <option value={720}>限制到 720p</option>
-            </select>
-            <div className='mt-1 text-xs text-slate-500'>降分辨率是省体积最有效的手段。</div>
+            <div className='flex flex-wrap gap-2'>
+              {RESOLUTION_OPTIONS.map((o) => (
+                <button
+                  key={o.value}
+                  className={modeBtnCls(compress.maxHeight === o.value)}
+                  onClick={() => updateCompress({ maxHeight: o.value as 0 | 1440 | 1080 | 720 })}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+            <div className='mt-1 text-xs text-slate-500'>降分辨率是省体积最有效的手段，与旋转压缩对话框同步。</div>
           </div>
           <div>
             <label className={labelCls}>帧率上限</label>

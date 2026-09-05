@@ -9,6 +9,7 @@ import RotateCompressDialog from './components/RotateCompressDialog'
 import SettingsPage from './components/SettingsPage'
 import Sidebar, { type Filters } from './components/Sidebar'
 import TagPage from './components/TagPage'
+import TagSearchPanel from './components/TagSearchPanel'
 import VideoDetail from './components/VideoDetail'
 import VideoEditForm from './components/VideoEditForm'
 import VideoGrid, { DEFAULT_COVER_H, groupByWork } from './components/VideoGrid'
@@ -47,6 +48,8 @@ export default function App() {
   const [view, setView] = useState<'library' | 'tags' | 'actors' | 'settings'>('library')
   // 目录栏外部刷新信号（文件监听/窗口聚焦触发）
   const [dirSignal, setDirSignal] = useState(0)
+  // 标签搜索面板（库视图右侧栏）：开启后主区预览 + 右侧标签栏，点标签筛选视频
+  const [tagSearchOpen, setTagSearchOpen] = useState(false)
   // 框选选中的视频 id（用于批量删除/批量编辑）
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   // 所选视频的总大小（批量压缩前很有参考价值）
@@ -114,6 +117,16 @@ export default function App() {
   async function changeViewMode(mode: 'grid' | 'list') {
     setViewMode(mode)
     await window.api.setSetting({ key: 'viewMode', value: mode })
+  }
+
+  // 标签搜索面板里点标签：加入/移出 tagIds 筛选（多标签「同时包含」语义，主进程保证）。
+  // 未选目录（filters 为 null）时点标签会以 {} 为基底，直接列出全库中含该标签的视频。
+  function toggleTagFilter(tagId: number) {
+    setFilters((f) => {
+      const cur = f?.tagIds ?? []
+      const next = cur.includes(tagId) ? cur.filter((t) => t !== tagId) : [...cur, tagId]
+      return { ...(f ?? {}), tagIds: next.length > 0 ? next : undefined }
+    })
   }
 
   const reloadVideos = useCallback(async (offset = 0) => {
@@ -518,6 +531,7 @@ export default function App() {
           onManageActors={() => setView('actors')}
           onManageTags={() => setView('tags')}
           onOpenSettings={() => setView('settings')}
+          view={view}
           onDropVideos={moveVideosToDir}
           onMoveDir={moveDir}
           refreshSignal={dirSignal}
@@ -536,6 +550,7 @@ export default function App() {
           ) : view === 'tags' ? (
             <TagPage
               tags={tags}
+              actors={actors}
               onChanged={reloadMeta}
               onFilter={(tagIds) => { setFilters({ tagIds }); setView('library') }}
             />
@@ -619,6 +634,18 @@ export default function App() {
                     ))}
                 </div>
                 <div className='flex shrink-0 items-center gap-2'>
+                {/* 标签搜索：开/关右侧标签栏（点标签筛选视频，多选 AND） */}
+                <button
+                  className={`flex h-[30px] items-center rounded-lg border px-2.5 text-xs transition-colors ${
+                    tagSearchOpen
+                      ? 'border-cyan-500 bg-cyan-600/20 text-cyan-300'
+                      : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                  }`}
+                  onClick={() => setTagSearchOpen((v) => !v)}
+                  title='打开右侧标签栏：点标签筛选视频，可多选（同时包含全部所选标签）'
+                >
+                  标签搜索
+                </button>
                 {/* 视图切换：瀑布流（2×2 方块）/ 列表（三横杠） */}
                 <div className='flex overflow-hidden rounded-lg border border-slate-700'>
                   <button
@@ -699,6 +726,10 @@ export default function App() {
             </>
           )}
         </main>
+        {/* 标签搜索面板：预览区右侧的标签栏（中间预览 + 右侧标签，仅库视图显示） */}
+        {tagSearchOpen && view === 'library' && (
+          <TagSearchPanel tags={tags} selectedIds={filters?.tagIds ?? []} onToggle={toggleTagFilter} />
+        )}
       </div>
 
       {/* 框选后的批量操作栏 */}

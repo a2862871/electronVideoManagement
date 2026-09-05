@@ -41,6 +41,8 @@ interface Props {
   onManageActors(): void
   onManageTags(): void
   onOpenSettings(): void
+  /** 当前主区视图：非 library（演员/标签管理、设置）时收起二级目录栏 */
+  view: 'library' | 'tags' | 'actors' | 'settings'
   /** 目录树中子目录被删除后回调（用于刷新列表/清理失效筛选） */
   onDirDeleted?(): void
   /** 移动整个文件夹（改名/搼到其他目录），由 App 处理（选目标、调用后端、刷新） */
@@ -848,7 +850,7 @@ function ActorColumn({
   )
 }
 
-export default function Sidebar({ folders, filters, onChange, onManageActors, onManageTags, onOpenSettings, onDirDeleted, onMoveDir, onDropVideos, refreshSignal }: Props) {
+export default function Sidebar({ folders, filters, onChange, onManageActors, onManageTags, onOpenSettings, onDirDeleted, onMoveDir, onDropVideos, refreshSignal, view }: Props) {
   const folder = folders.find((f) => f.id === filters?.folderId)
   // 主目录按钮的拖放悬停高亮（拖到监控文件夹根 = 移到该文件夹根目录）
   const [dropFolder, setDropFolder] = useState<string | null>(null)
@@ -1051,8 +1053,8 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
         </div>
       </div>
 
-      {/* actor 模式：演员栏（替代目录分栏；支持收藏/排序/过滤，宽度可拖拽） */}
-      {isActorMode && folder && (
+      {/* actor 模式：演员栏（替代目录分栏；支持收藏/排序/过滤，宽度可拖拽）；管理/设置界面时收起 */}
+      {view === 'library' && isActorMode && folder && (
         <ActorColumn
           folderId={folder.id}
           activeActorId={filters?.actorId}
@@ -1066,8 +1068,8 @@ export default function Sidebar({ folders, filters, onChange, onManageActors, on
         />
       )}
 
-      {/* tree 模式：后续分栏，二级、三级……子目录（宽度可拖拽，按主目录+栏序号记忆；第一栏带文件夹过滤框） */}
-      {!isActorMode && dirColumns.map((col, i) => {
+      {/* tree 模式：后续分栏，二级、三级……子目录（宽度可拖拽，按主目录+栏序号记忆；第一栏带文件夹过滤框）；管理/设置界面时收起 */}
+      {view === 'library' && !isActorMode && dirColumns.map((col, i) => {
         const folderPath = folder?.path ?? ''
         const wKey = `${folderPath}#${i}`
         return (
