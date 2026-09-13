@@ -10,14 +10,45 @@ import SettingsPage from './components/SettingsPage'
 import Sidebar, { type Filters } from './components/Sidebar'
 import TagPage from './components/TagPage'
 import TagSearchPanel from './components/TagSearchPanel'
-import VideoDetail from './components/VideoDetail'
+import VideoDetail, { type PlaylistScope } from './components/VideoDetail'
 import VideoEditForm from './components/VideoEditForm'
 import VideoGrid, { DEFAULT_COVER_H, groupByWork } from './components/VideoGrid'
 import VideoTable from './components/VideoTable'
 import { formatSizeGB } from './utils/media'
-import type { ActorDto, CompressProgress, DirMoveProgress, TagDto, VideoDetailDto, VideoDto, WatchFolderDto } from './type/library'
+import type { ActorDto, CompressProgress, DirMoveProgress, TagDto, VideoDetailDto, VideoDto, VideoQuery, WatchFolderDto } from './type/library'
 
 const PAGE_SIZE = 60
+
+/**
+ * 由当前筛选/搜索状态构造视频查询条件。
+ * 列表页（reloadVideos）与播放列表（打开播放器时冻结的范围）共用同一份逻辑，
+ * 保证播放列表显示的就是用户当前列表里的全部视频。
+ */
+function buildVideoQuery(args: {
+  filters: Filters | null
+  search: string
+  dirSearch: string
+  sort: 'newest' | 'oldest' | 'name'
+}): VideoQuery {
+  const kw = args.search.trim()
+  const dirKw = args.dirSearch.trim()
+  const globalSearch = kw !== ''
+  const dirScopeSearch = !globalSearch && dirKw !== ''
+  return {
+    search: dirScopeSearch ? dirKw : kw || undefined,
+    folderId: args.filters?.folderId,
+    // 全局搜索时只按主目录限定范围：忽略演员/标签/子目录筛选（搜索结果 = 主目录）
+    tagIds: globalSearch ? undefined : args.filters?.tagIds,
+    actorId: globalSearch ? undefined : args.filters?.actorId,
+    dirPath: globalSearch ? undefined : args.filters?.dirPath,
+    sort: args.sort,
+  }
+}
+
+/** 取路径最后一段（用于播放列表标题） */
+function lastSeg(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() ?? p
+}
 
 export default function App() {
   const [ready, setReady] = useState<boolean | null>(null)
@@ -38,6 +69,8 @@ export default function App() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [notice, setNotice] = useState('')
   const [openVideoId, setOpenVideoId] = useState<number | null>(null)
+  // 播放列表范围：打开播放器时按当时的筛选/搜索冻结，之后在列表内切换视频不再重算
+  const [playScope, setPlayScope] = useState<PlaylistScope | null>(null)
   const [cardMenu, setCardMenu] = useState<{ x: number; y: number; video: VideoDto } | null>(null)
   const [editVideo, setEditVideo] = useState<VideoDetailDto | null>(null)
   const [captureVideo, setCaptureVideo] = useState<{ videoPath: string; videoId: number } | null>(null)
@@ -132,30 +165,39 @@ export default function App() {
   const reloadVideos = useCallback(async (offset = 0) => {
     const kw = search.trim()
     const dirKw = dirSearch.trim()
-    // 全局搜索开启时优先（结果 = 主目录，忽略子目录/演员/标签）；
-    // 否则若有目录内搜索词，则与当前目录路径（及演员/标签筛选）叠加。
-    const globalSearch = kw !== ''
-    const dirScopeSearch = !globalSearch && dirKw !== ''
     // 未选择任何目录（且无搜索词）时不查询：主区域保持为空，选中目录后才列出视频
     if (filters === null && !kw && !dirKw) {
       setRows([])
       setTotal(0)
       return
     }
+    // 全局搜索开启时优先（结果 = 主目录，忽略子目录/演员/标签）；
+    // 否则若有目录内搜索词，则与当前目录路径（及演员/标签筛选）叠加。
     const page = await window.api.queryVideos({
-      search: dirScopeSearch ? dirKw : kw || undefined,
-      folderId: filters?.folderId,
-      // 全局搜索时只按主目录限定范围：忽略演员/标签/子目录筛选（搜索结果 = 主目录）
-      tagIds: globalSearch ? undefined : filters?.tagIds,
-      actorId: globalSearch ? undefined : filters?.actorId,
-      dirPath: globalSearch ? undefined : filters?.dirPath,
-      sort,
+      ...buildVideoQuery({ filters, search, dirSearch, sort }),
       limit: PAGE_SIZE,
       offset,
     })
     setRows((prev) => (offset === 0 ? page.rows : [...prev, ...page.rows]))
     setTotal(page.total)
   }, [search, dirSearch, filters, sort])
+
+  // 打开播放器：把「当前列表范围」（目录/演员/标签/搜索）冻结成播放列表传入，
+  // 播放器右侧即可浏览该范围内的全部视频并直接切换（无需返回列表重新查找）
+  function openVideo(v: VideoDto) {
+    const kw = search.trim()
+    const dirKw = dirSearch.trim()
+    const q = buildVideoQuery({ filters, search, dirSearch, sort })
+    let title = '播放列表'
+    if (kw) title = `搜索：${kw}`
+    else if (filters?.dirPath) title = `目录：${lastSeg(filters.dirPath)}${dirKw ? `（搜索：${dirKw}）` : ''}`
+    else if (filters?.actorId) title = `演员：${actors.find((a) => a.id === filters.actorId)?.name ?? ''}`
+    else if (filters?.tagIds?.length)
+      title = `标签：${filters.tagIds.map((id) => tags.find((t) => t.id === id)?.name ?? id).join(' + ')}`
+    else if (filters?.folderId) title = `主目录：${folders.find((f) => f.id === filters.folderId)?.name ?? ''}`
+    setPlayScope({ title, query: q })
+    setOpenVideoId(v.id)
+  }
 
   useEffect(() => {
     if (!hasApi) {
@@ -698,7 +740,7 @@ export default function App() {
                   showDuration={showDuration}
                   showSize={showSize}
                   coverH={coverH}
-                  onOpen={(v) => setOpenVideoId(v.id)}
+                  onOpen={openVideo}
                   onCardContextMenu={(e, v) => {
                     e.preventDefault()
                     setCardMenu({ x: e.clientX, y: e.clientY, video: v })
@@ -709,7 +751,7 @@ export default function App() {
                   videos={rows}
                   selectedIds={selectedIds}
                   onSelectionChange={setSelectedIds}
-                  onOpen={(v) => setOpenVideoId(v.id)}
+                  onOpen={openVideo}
                   onRowContextMenu={(e, v) => {
                     e.preventDefault()
                     setCardMenu({ x: e.clientX, y: e.clientY, video: v })
@@ -891,6 +933,8 @@ export default function App() {
       {openVideoId !== null && (
         <VideoDetail
           videoId={openVideoId}
+          playlist={playScope}
+          onOpenVideo={setOpenVideoId}
           onClose={() => setOpenVideoId(null)}
         />
       )}

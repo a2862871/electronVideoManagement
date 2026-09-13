@@ -85,6 +85,31 @@ export interface VideoPageDto {
   rows: VideoDto[]
 }
 
+/** 播放列表项（播放器侧栏用：只含播放/展示所需字段，不含剧情等大字段） */
+export interface PlaylistItemDto {
+  id: number
+  filename: string
+  title: string | null
+  num: string | null
+  part: string | null
+  sub_dir: string | null
+  runtime: number | null
+  size_bytes: number | null
+  play_position_sec: number
+  /** 缩略图：BLOB（数据库）优先，其次 NFO 自带的 thumb / poster / fanart 磁盘图 */
+  thumb_path: string | null
+  poster_path: string | null
+  fanart_path: string | null
+  /** 数据库 BLOB 缩略图版本号（0 = 无 BLOB） */
+  thumb_blob_ver: number
+}
+
+export interface PlaylistPageDto {
+  /** 符合条件的视频总数（可能大于 rows.length，主进程上限 2000 条） */
+  total: number
+  rows: PlaylistItemDto[]
+}
+
 export interface ScanSummaryDto {
   folderId: number
   scanned: number
@@ -265,6 +290,8 @@ export interface LibraryApi {
   pickDirectory(): Promise<string | null>
   scan(args?: { folderId?: number; dirPath?: string }): Promise<ScanSummaryDto[]>
   queryVideos(q: VideoQuery): Promise<VideoPageDto>
+  /** 播放列表：按与列表页相同的筛选条件查询（当前文件夹/演员/标签/搜索范围下的全部视频） */
+  getPlaylist(q: VideoQuery): Promise<PlaylistPageDto>
   getVideo(id: number): Promise<VideoDetailDto | null>
   /** 设置画面旋转角度（90° 步进），持久化到数据库 */
   setVideoRotation(args: { id: number; rotation: number }): Promise<void>

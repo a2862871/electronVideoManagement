@@ -47,6 +47,8 @@ contextBridge.exposeInMainWorld('api', {
   pickDirectory: () => ipcRenderer.invoke('folder:pick'),
   scan: (args?: { folderId?: number; dirPath?: string }) => ipcRenderer.invoke('scan:run', args),
   queryVideos: (q: Record<string, unknown>) => ipcRenderer.invoke('videos:query', q),
+  /** 播放列表（当前文件夹/演员/标签/搜索范围下的全部视频，仅必要字段） */
+  getPlaylist: (q: Record<string, unknown>) => ipcRenderer.invoke('videos:playlist', q),
   getVideo: (id: number) => ipcRenderer.invoke('video:get', id),
   /** 保存视频画面旋转角度（0/90/180/270），下次打开自动应用 */
   setVideoRotation: (args: { id: number; rotation: number }) => ipcRenderer.invoke('video:setRotation', args),

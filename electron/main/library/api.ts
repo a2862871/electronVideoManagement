@@ -647,7 +647,9 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
     return summaries
   })
 
-  ipcMain.handle('videos:query', (_e, q: VideoQuery) => {
+  // 视频查询的筛选条件：列表页（videos:query）与播放列表（videos:playlist）共用，
+  // 保证播放列表范围与用户看到的主列表完全一致
+  function buildVideoFilter(q: VideoQuery): { whereSql: string; args: (string | number)[] } {
     const where: string[] = []
     const args: (string | number)[] = []
 
@@ -686,22 +688,47 @@ export function registerLibraryIpc(db: DatabaseSync, opts: { dataDir: string; co
       args.push(like, like, like, like, like)
     }
 
-    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
-    const total = (db.prepare(`SELECT COUNT(*) AS c FROM videos v ${whereSql}`).get(...args) as { c: number }).c
-    const limit = q.limit ?? 60
-    const offset = q.offset ?? 0
-    const orderSql = q.sort === 'oldest'
+    return { whereSql: where.length ? `WHERE ${where.join(' AND ')}` : '', args }
+  }
+
+  // 排序：与列表页一致（newest 默认）
+  function videoOrderSql(sort?: VideoQuery['sort']): string {
+    return sort === 'oldest'
       ? 'ORDER BY v.created_at ASC, v.id ASC'
-      : q.sort === 'name'
+      : sort === 'name'
         // 按文件名排序：NOCASE 忽略英文大小写；数字按字典序（番号类文件名基本为字母数字，效果符合直觉）
         ? 'ORDER BY v.filename COLLATE NOCASE ASC, v.id ASC'
         : 'ORDER BY v.created_at DESC, v.id DESC'
+  }
+
+  ipcMain.handle('videos:query', (_e, q: VideoQuery) => {
+    const { whereSql, args } = buildVideoFilter(q)
+    const total = (db.prepare(`SELECT COUNT(*) AS c FROM videos v ${whereSql}`).get(...args) as { c: number }).c
+    const limit = q.limit ?? 60
+    const offset = q.offset ?? 0
     // thumb_blob_ver：video_thumbs.updated_at 的秒级时间戳（0 = 无 BLOB），前端用作图片缓存版本号
     const rows = db.prepare(
       `SELECT v.*, COALESCE(CAST(strftime('%s', t.updated_at) AS INTEGER), 0) AS thumb_blob_ver
        FROM videos v LEFT JOIN video_thumbs t ON t.video_id = v.id
-       ${whereSql} ${orderSql} LIMIT ? OFFSET ?`,
+       ${whereSql} ${videoOrderSql(q.sort)} LIMIT ? OFFSET ?`,
     ).all(...args, limit, offset)
+
+    return { total, rows }
+  })
+
+  // 播放列表（播放器右侧栏）：与列表页同一筛选条件，只返回播放/列表展示所需字段（不含剧情等），
+  // 最多 PLAYLIST_MAX 条（超大目录下的保护，前端会提示「已载入 x/y」）
+  const PLAYLIST_MAX = 2000
+  ipcMain.handle('videos:playlist', (_e, q: VideoQuery) => {
+    const { whereSql, args } = buildVideoFilter(q)
+    const total = (db.prepare(`SELECT COUNT(*) AS c FROM videos v ${whereSql}`).get(...args) as { c: number }).c
+    const rows = db.prepare(
+      `SELECT v.id, v.filename, v.title, v.num, v.part, v.sub_dir, v.runtime, v.size_bytes, v.play_position_sec,
+              v.thumb_path, v.poster_path, v.fanart_path,
+              COALESCE(CAST(strftime('%s', t.updated_at) AS INTEGER), 0) AS thumb_blob_ver
+       FROM videos v LEFT JOIN video_thumbs t ON t.video_id = v.id
+       ${whereSql} ${videoOrderSql(q.sort)} LIMIT ?`,
+    ).all(...args, PLAYLIST_MAX)
 
     return { total, rows }
   })
